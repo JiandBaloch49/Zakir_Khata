@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "DigiKhata",
+    "slug": "digikhata-app",
+    "version": "1.0.0",
+    "entryPoint": "./index.js",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B1015"
+    },
+    "android": {
+      "package": "com.digikhata.app"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "b817f3e3-dc43-43c4-aef6-d6676ceda7b0"
+      }
+    }
+  }
+}
