@@ -2,7 +2,8 @@ import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Modal, TextInput, Alert, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StockItem, StockMovement } from '../../types/stock.types';
-import { getMovementsByItemId, addStockMovement } from '../../services/database/stockDb';
+import { getItemMovements, getItemMovementMonths, addStockMovement } from '../../services/database/stockDb';
+import { PAGE_SIZE, PageCursor } from '../../services/database/pagination';
 import { formatCurrency } from '../../utils/calculations';
 import { getDisplayName } from '../../utils/displayName';
 import { useSettingsStore } from '../../store/useSettingsStore';
@@ -37,19 +38,46 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
   const [selectedMonth, setSelectedMonth] = useState<string>(getCurrentMonthKey);
   const monthScrollRef = useRef<ScrollView>(null);
 
-  useEffect(() => {
-    const loadMovements = async () => {
-      try {
-        const data = await getMovementsByItemId(item.id);
-        setMovements(data);
-      } catch (err) {
-        if (__DEV__) console.error('Failed to load stock movements:', err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    loadMovements();
-  }, [item.id]);
+  // The selected month is filtered in SQL and its In/Out totals are a SQL aggregate;
+  // only that month's rows are fetched, PAGE_SIZE at a time.
+  const [monthsWithMovement, setMonthsWithMovement] = useState<string[]>([]);
+  const [stats, setStats] = useState({ totalIn: 0, totalOut: 0, count: 0 });
+  const [cursor, setCursor] = useState<PageCursor | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const loadMovements = async () => {
+    setLoading(true);
+    try {
+      const [{ rows, summary, nextCursor }, months] = await Promise.all([
+        getItemMovements(item.id, selectedMonth, PAGE_SIZE),
+        getItemMovementMonths(item.id),
+      ]);
+      setMovements(rows);
+      setStats(summary);
+      setCursor(nextCursor);
+      setMonthsWithMovement(months);
+    } catch (err) {
+      if (__DEV__) console.error('Failed to load stock movements:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadMore = async () => {
+    if (!cursor || loadingMore || loading) return;
+    setLoadingMore(true);
+    try {
+      const { rows, nextCursor } = await getItemMovements(item.id, selectedMonth, PAGE_SIZE, cursor);
+      setMovements(prev => [...prev, ...rows]);
+      setCursor(nextCursor);
+    } catch (err) {
+      if (__DEV__) console.error('Failed to load more movements:', err);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  useEffect(() => { loadMovements(); }, [item.id, selectedMonth]);
 
   // Generate available month options in chronological sequential order (Jan to Dec)
   const availableMonths = useMemo(() => {
@@ -62,19 +90,12 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
       monthSet.add(`${currentYear}-${mm}`);
     }
 
-    // Add any additional months present in movements
-    movements.forEach(m => {
-      if (m.date) {
-        const key = m.date.substring(0, 7);
-        if (key.match(/^\d{4}-\d{2}$/)) {
-          monthSet.add(key);
-        }
-      }
-    });
+    // Months in which this item actually moved — from SQL, not from loaded rows.
+    monthsWithMovement.forEach(key => monthSet.add(key));
 
     const sorted = Array.from(monthSet).sort(); // Ascending chronological order: Jan -> Dec
     return ['ALL', ...sorted];
-  }, [movements]);
+  }, [monthsWithMovement]);
 
   // Auto scroll to active month pill
   useEffect(() => {
@@ -86,25 +107,9 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
     }
   }, [selectedMonth, availableMonths]);
 
-  // Filtered movements by selected month
-  const filteredMovements = useMemo(() => {
-    if (selectedMonth === 'ALL') return movements;
-    return movements.filter(m => m.date && m.date.startsWith(selectedMonth));
-  }, [movements, selectedMonth]);
-
-  // Monthly summary stats
-  const monthlyStats = useMemo(() => {
-    let totalIn = 0;
-    let totalOut = 0;
-    filteredMovements.forEach(m => {
-      if (m.change > 0) {
-        totalIn += m.change;
-      } else {
-        totalOut += Math.abs(m.change);
-      }
-    });
-    return { totalIn, totalOut, netChange: totalIn - totalOut };
-  }, [filteredMovements]);
+  // Rows are already the selected month (SQL); stats are the month's SQL aggregate.
+  const filteredMovements = movements;
+  const monthlyStats = { totalIn: stats.totalIn, totalOut: stats.totalOut, netChange: stats.totalIn - stats.totalOut };
 
   const openModal = (mode: 'in' | 'out') => {
     setModalMode(mode);
@@ -151,8 +156,8 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
         note: inputNote.trim() || undefined,
       };
 
-      const newMov = await addStockMovement(movement);
-      setMovements(prev => [newMov, ...prev]);
+      await addStockMovement(movement);
+      await loadMovements();
       item.quantity += movement.change;
       setModalVisible(false);
     } catch (error) {
@@ -264,7 +269,7 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
         {/* Stock Entries List (Takes Max Height) */}
         <View style={styles.listContainer}>
           <View style={styles.listHeader}>
-            <Text style={styles.listTitle}>Stock Entries ({filteredMovements.length})</Text>
+            <Text style={styles.listTitle}>Stock Entries ({stats.count})</Text>
           </View>
           {loading ? (
             <View style={styles.center}>
@@ -280,6 +285,9 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
               keyExtractor={(mov) => mov.id}
               renderItem={renderMovement}
               contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 16 }}
+              onEndReached={loadMore}
+              onEndReachedThreshold={0.5}
+              ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
             />
           )}
         </View>

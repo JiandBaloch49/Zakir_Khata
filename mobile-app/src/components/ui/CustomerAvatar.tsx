@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { View, Text, Image, StyleProp, ViewStyle, TextStyle } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
 
 /**
  * Customer picture with the fallback chain the data layer promises:
@@ -15,6 +16,7 @@ export const CustomerAvatar = ({ name, uri, style, textStyle }: {
   style?: StyleProp<ViewStyle>;
   textStyle?: StyleProp<TextStyle>;
 }) => {
+  const t = useLanguageStore(s => s.t);
   const [failed, setFailed] = useState<string | null>(null);
   const showImage = !!uri && failed !== uri;
   return (
@@ -24,7 +26,7 @@ export const CustomerAvatar = ({ name, uri, style, textStyle }: {
           source={{ uri: uri as string }}
           style={{ width: '100%', height: '100%' }}
           onError={() => setFailed(uri as string)}
-          accessibilityLabel={`Photo of ${name}`}
+          accessibilityLabel={t('photoOf', { name })}
         />
       ) : (
         <Text style={textStyle}>{(name.trim().charAt(0) || '?').toUpperCase()}</Text>

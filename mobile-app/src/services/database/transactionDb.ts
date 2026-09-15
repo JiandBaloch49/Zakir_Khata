@@ -3,6 +3,7 @@ import { Transaction } from '../../types';
 import { writeWithSync } from './syncHelpers';
 import { userScope, userScopeParams } from './queryHelpers';
 import { parseDateValue } from '../../utils/dates';
+import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
 
 export type KhataFilter = {
   startDate?: string;
@@ -11,8 +12,14 @@ export type KhataFilter = {
   search?: string;
 };
 
-/** One predicate for both rows and whole-result paisa aggregates. */
-export const getFilteredKhata = async (userId: string, filter: KhataFilter = {}, limit = -1, offset = 0) => {
+/** Per-calendar-day subtotal of the filtered ledger, for the Khata list's day headers. */
+export type KhataDayTotal = { day: string; lena: number; dena: number; entryCount: number };
+
+/**
+ * THE one predicate for the Khata list: rows, the Lena/Dena/Net summary and the
+ * per-day subtotals are all built from here, so none of them can disagree.
+ */
+const khataWhere = (userId: string, filter: KhataFilter) => {
   for (const date of [filter.startDate, filter.endDate]) {
     if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date))) {
       throw new Error('Invalid date range.');
@@ -35,10 +42,30 @@ export const getFilteredKhata = async (userId: string, filter: KhataFilter = {},
     where += " AND (instr(lower(COALESCE(partyName, '')), ?) > 0 OR instr(lower(COALESCE(notes, '')), ?) > 0)";
     params.push(filter.search.toLowerCase(), filter.search.toLowerCase());
   }
+  return { where, params };
+};
+
+const KHATA_KEYS = { date: 'date', createdAt: 'createdAt', id: 'id' } as const;
+
+/**
+ * One predicate for both rows and whole-result paisa aggregates.
+ *
+ * Paging: pass `after` (the previous page's cursor) for the next `limit` rows in
+ * `date DESC, createdAt DESC, id DESC` order. The cursor is applied to the ROWS
+ * query ONLY — balanceSummary always covers the whole filtered set, so Total Lena /
+ * Dena / Net never depend on how many pages are loaded. `limit/offset` remain for
+ * existing callers.
+ */
+export const getFilteredKhata = async (
+  userId: string, filter: KhataFilter = {}, limit = -1, offset = 0, after?: PageCursor | null
+) => {
+  const { where, params } = khataWhere(userId, filter);
   const db = await getDatabase();
+  const rowsWhere = after ? `${where} AND ${keysetClause(KHATA_KEYS)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after)] : params;
   const transactions = await db.getAllAsync<Transaction>(
-    `SELECT * FROM transactions WHERE ${where} ORDER BY date DESC, createdAt DESC, id DESC LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
+    `SELECT * FROM transactions WHERE ${rowsWhere} ORDER BY date DESC, createdAt DESC, id DESC LIMIT ? OFFSET ?`,
+    [...rowsParams, limit, offset]
   );
   const summary = await db.getFirstAsync<{ totalLena: number; totalDena: number }>(
     `SELECT COALESCE(SUM(CASE WHEN type = 'lena' THEN amount_paisa ELSE 0 END), 0) as totalLena,
@@ -46,7 +73,30 @@ export const getFilteredKhata = async (userId: string, filter: KhataFilter = {},
      FROM transactions WHERE ${where}`, params
   );
   const { totalLena = 0, totalDena = 0 } = summary || {};
-  return { transactions, balanceSummary: { totalLena, totalDena, netBalance: totalLena - totalDena } };
+  return {
+    transactions,
+    balanceSummary: { totalLena, totalDena, netBalance: totalLena - totalDena },
+    nextCursor: nextCursorOf(transactions, limit, KHATA_KEYS),
+  };
+};
+
+/**
+ * Every calendar day in the filtered ledger with its own SQL subtotal — ONE query per
+ * filter change, never per page, never a sum of loaded rows. Keyed by date(date) so
+ * legacy timestamp rows fall on their day.
+ */
+export const getKhataDayTotals = async (userId: string, filter: KhataFilter = {}): Promise<KhataDayTotal[]> => {
+  const { where, params } = khataWhere(userId, filter);
+  const db = await getDatabase();
+  return db.getAllAsync<KhataDayTotal>(
+    `SELECT date(date) AS day,
+            COALESCE(SUM(CASE WHEN type = 'lena' THEN amount_paisa ELSE 0 END), 0) AS lena,
+            COALESCE(SUM(CASE WHEN type = 'dena' THEN amount_paisa ELSE 0 END), 0) AS dena,
+            COUNT(*) AS entryCount
+       FROM transactions WHERE ${where}
+      GROUP BY date(date)
+      ORDER BY day DESC`, params
+  );
 };
 
 export type { Transaction };

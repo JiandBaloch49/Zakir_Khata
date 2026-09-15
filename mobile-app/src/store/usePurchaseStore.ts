@@ -1,19 +1,40 @@
 import { create } from 'zustand';
+import { PAGE_SIZE, PageCursor } from '../services/database/pagination';
+import { thisMonthRange } from '../utils/dates';
 import {
   PurchaseOrder, PurchaseOrderItem, PurchaseInvoice,
   PurchaseReturn, PurchaseSummary, POStatus, InvoiceStatus
 } from '../types/purchase.types';
 import {
   createPurchaseOrder, getPurchaseOrders, getPurchaseOrderById,
+  getFilteredPurchaseOrders, getPurchaseOrderDayTotals, getFilteredPurchaseInvoices, getPurchaseInvoiceDayTotals,
+  PurchaseFilter, PurchaseDayTotal,
   updatePurchaseOrderStatus, receiveGoods,
   createPurchaseInvoice, getPurchaseInvoices, getPurchaseInvoiceById,
   getPurchaseInvoicesBySupplier, createPurchaseReturn,
   getPurchaseSummary
 } from '../services/database/purchaseDb';
 
+export type PurchaseListState = {
+  rows: any[];
+  summary: { count: number; total: number; settled: number };
+  dayTotals: Record<string, PurchaseDayTotal>;
+  cursor: PageCursor | null;
+  loadingMore: boolean;
+};
+const EMPTY_LIST: PurchaseListState = { rows: [], summary: { count: 0, total: 0, settled: 0 }, dayTotals: {}, cursor: null, loadingMore: false };
+
 interface PurchaseState {
   orders: PurchaseOrder[];
   invoices: PurchaseInvoice[];
+  /** Range the Purchase Book shows (this month by default); shared by both tabs. */
+  filter: PurchaseFilter;
+  /** Paged, SQL-summarised lists for the two tabs. */
+  orderList: PurchaseListState;
+  invoiceList: PurchaseListState;
+  setFilter: (userId: string, filter: PurchaseFilter) => Promise<void>;
+  loadLists: (userId: string) => Promise<void>;
+  loadMore: (userId: string, tab: 'orders' | 'invoices') => Promise<void>;
   selectedOrder: PurchaseOrder | null;
   selectedInvoice: PurchaseInvoice | null;
   summary: PurchaseSummary | null;
@@ -59,11 +80,52 @@ interface PurchaseState {
 export const usePurchaseStore = create<PurchaseState>((set, get) => ({
   orders: [],
   invoices: [],
+  filter: { ...thisMonthRange() },
+  orderList: EMPTY_LIST,
+  invoiceList: EMPTY_LIST,
   selectedOrder: null,
   selectedInvoice: null,
   summary: null,
   loading: false,
   error: null,
+
+  setFilter: async (userId, filter) => {
+    set({ filter });
+    await get().loadLists(userId);
+  },
+
+  // Page 1 of both tabs + whole-set summaries + day subtotals, one predicate per tab.
+  loadLists: async (userId) => {
+    set({ loading: true, error: null });
+    const filter = get().filter;
+    try {
+      const [o, od, i, id] = await Promise.all([
+        getFilteredPurchaseOrders(userId, filter, PAGE_SIZE),
+        getPurchaseOrderDayTotals(userId, filter),
+        getFilteredPurchaseInvoices(userId, filter, PAGE_SIZE),
+        getPurchaseInvoiceDayTotals(userId, filter),
+      ]);
+      set({
+        orderList: { rows: o.rows, summary: o.summary, cursor: o.nextCursor, dayTotals: Object.fromEntries(od.map(d => [d.day, d])), loadingMore: false },
+        invoiceList: { rows: i.rows, summary: i.summary, cursor: i.nextCursor, dayTotals: Object.fromEntries(id.map(d => [d.day, d])), loadingMore: false },
+        loading: false,
+      });
+    } catch (e: any) { set({ error: e.message, loading: false }); }
+  },
+
+  // Next page of one tab, strictly after its last loaded row. Totals are NOT refetched.
+  loadMore: async (userId, tab) => {
+    const key = tab === 'orders' ? 'orderList' : 'invoiceList';
+    const cur = get()[key];
+    if (!cur.cursor || cur.loadingMore || get().loading) return;
+    set({ [key]: { ...cur, loadingMore: true } } as any);
+    try {
+      const page = tab === 'orders'
+        ? await getFilteredPurchaseOrders(userId, get().filter, PAGE_SIZE, cur.cursor)
+        : await getFilteredPurchaseInvoices(userId, get().filter, PAGE_SIZE, cur.cursor);
+      set(s => ({ [key]: { ...s[key], rows: [...s[key].rows, ...page.rows], cursor: page.nextCursor, loadingMore: false } } as any));
+    } catch (e: any) { set(s => ({ [key]: { ...s[key], loadingMore: false }, error: e.message } as any)); }
+  },
 
   loadOrders: async (userId, status) => {
     set({ loading: true, error: null });

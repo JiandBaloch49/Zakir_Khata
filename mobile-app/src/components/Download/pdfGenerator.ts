@@ -4,10 +4,12 @@ import {
   CASH_RECEIPT_TEMPLATE,
   EXPENSE_REPORT_TEMPLATE,
   STOCK_REPORT_TEMPLATE,
+  STOCK_MOVEMENT_TEMPLATE,
   BILL_REPORT_TEMPLATE,
   STAFF_REPORT_TEMPLATE,
 } from './reportTemplates';
 import { getDatabase } from '../../services/database/db';
+import { getStockMovementReport } from '../../services/database/stockDb';
 import { generateCsvFile } from './csvGenerator';
 import { formatCurrency, paisaToRupeesString } from '../../utils/calculations';
 import { todayDate, formatDisplayDate } from '../../utils/dates';
@@ -160,6 +162,39 @@ export const generateReportFile = async (options: ReportOptions): Promise<string
     const html = fill(STOCK_REPORT_TEMPLATE, {
       business_name: esc(bName), period: periodLabel, rows,
       totalInValue: formatCurrency(totalIn), totalOutValue: formatCurrency(totalOut),
+    });
+    return (await Print.printToFileAsync({ html })).uri;
+  }
+
+  // ── STOCK IN / STOCK OUT (one movement per row, as the report screens list) ─
+  if (options.reportType === 'stockIn' || options.reportType === 'stockOut') {
+    const direction = options.reportType === 'stockIn' ? 'in' : 'out';
+    const label = direction === 'in' ? 'IN' : 'OUT';
+    // Same function, same predicate and SQL aggregate as StockIn/OutReportScreen.
+    const { rows: records, summary } = await getStockMovementReport(options.userId, direction, period.startDate, period.endDate);
+    const rateOf = (r: any) => direction === 'in' ? (r.cost_per_unit ?? 0) : (r.sale_price_unit ?? r.cost_per_unit ?? 0);
+    const qtyOf = (r: any) => Math.abs(r.change ?? 0);
+
+    if (options.format === 'csv') {
+      return generateCsvFile(options, records, ['Item', 'Date', `Qty ${label}`, 'Rate', 'Amount'],
+        r => [`"${r.item_name_en || ''}"`, fmtDate(r.date), String(qtyOf(r)),
+              paisaToRupeesString(rateOf(r)), paisaToRupeesString(qtyOf(r) * rateOf(r))]);
+    }
+
+    let rows = '';
+    records.forEach(r => {
+      rows += `<tr><td>${esc(r.item_name_en)}</td><td>${fmtDate(r.date)}</td>` +
+              `<td class="num ${direction}">${qtyOf(r)}</td>` +
+              `<td class="num">${formatCurrency(rateOf(r))}</td>` +
+              `<td class="num ${direction}">${formatCurrency(qtyOf(r) * rateOf(r))}</td></tr>`;
+    });
+    if (!records.length) rows = emptyRow(5);
+
+    const html = fill(STOCK_MOVEMENT_TEMPLATE, {
+      business_name: esc(bName), direction: label, period: periodLabel, rows,
+      entries: String(summary.entries), totalQty: String(summary.qty),
+      amountLabel: direction === 'in' ? 'purchase value' : 'sale value',
+      totalAmount: formatCurrency(summary.amount),
     });
     return (await Print.printToFileAsync({ html })).uri;
   }

@@ -67,7 +67,9 @@ export const useDashboardStore = create<DashboardState>((set) => ({
         getTodayBillsCount(userId),
         calculatePendingPayments(userId),
         getStockItemsByUserId(userId, true), // filterLowStock = true
-        getActivities(userId, { startDate: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() }) // Last 7 days
+        // Last 7 days, newest five. A lone startDate now works (it used to be ignored,
+        // silently returning the latest 100 of all time).
+        getActivities(userId, { startDate: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() }, 5)
       ]);
 
       set({
@@ -82,7 +84,7 @@ export const useDashboardStore = create<DashboardState>((set) => ({
           lowStockAlerts: stockItems.length,
           pendingPayments,
         },
-        recentActivities: activities.slice(0, 5), // Only keep the 5 most recent
+        recentActivities: activities.rows,
         loading: false,
       });
     } catch (error) {

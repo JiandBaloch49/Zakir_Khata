@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, FlatList, ScrollView,
+  View, Text, TouchableOpacity, StyleSheet, SectionList, ScrollView,
   Animated, ActivityIndicator, Dimensions, Keyboard, Platform
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -11,13 +11,14 @@ import { Colors } from '../../theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
 import { formatCurrency } from '../../utils/calculations';
 import { DateRangeFilter, DateRange, describeRange } from '../../components/ui/DateRangeFilter';
+import { toDateValue, formatDisplayDate } from '../../utils/dates';
 
 export const ExpenseBookScreen = ({ navigation }: any) => {
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
   const {
-    expenses, loading, monthlyTotal,
-    fetchExpenses, filter, setFilter
+    expenses, loading, loadingMore, dayTotals, monthlyTotal,
+    fetchExpenses, loadMoreExpenses, filter, setFilter
   } = useExpenseStore();
 
   const range: DateRange = { startDate: filter.startDate, endDate: filter.endDate };
@@ -69,6 +70,39 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
   }, [user]);
 
   const rangeLabel = describeRange(range);
+
+  // Loaded expenses grouped by expense day; a day straddling a page boundary keeps
+  // ONE section whose header shows the day's whole SQL subtotal.
+  const sections = React.useMemo(() => {
+    const byDay = new Map<string, Expense[]>();
+    for (const e of expenses) {
+      const day = toDateValue(e.expense_date as string) || String(e.expense_date);
+      const list = byDay.get(day);
+      if (list) list.push(e); else byDay.set(day, [e]);
+    }
+    return [...byDay.entries()].map(([day, data]) => ({ day, data }));
+  }, [expenses]);
+
+  // Day header: entry count and the day's total spend.
+  const renderSectionHeader = React.useCallback(({ section }: { section: { day: string } }) => {
+    const t = dayTotals[section.day];
+    return (
+      <View style={styles.dayHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
+          {t && <Text style={styles.dayCount}>{t.entryCount} {t.entryCount === 1 ? 'Entry' : 'Entries'}</Text>}
+        </View>
+        {t && (
+          <View style={styles.dayRight}>
+            <Text style={[styles.dayColLabel, { color: Colors.textGray }]}>Spent</Text>
+            <Text style={[styles.dayColVal, { color: Colors.error }]}>{formatCurrency(t.totalExpense)}</Text>
+          </View>
+        )}
+      </View>
+    );
+  }, [dayTotals]);
+
+  const loadMore = React.useCallback(() => { if (user) loadMoreExpenses(user.id); }, [user, loadMoreExpenses]);
 
   const renderItem = ({ item }: { item: Expense }) => {
     return (
@@ -123,11 +157,21 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
           </View>
         </ScrollView>
       ) : (
-        <FlatList
-          data={expenses}
+        <SectionList
+          sections={sections}
           keyExtractor={item => item.id}
           renderItem={renderItem}
+          renderSectionHeader={renderSectionHeader}
+          stickySectionHeadersEnabled
           contentContainerStyle={{ padding: 12, paddingBottom: 140 }}
+          SectionSeparatorComponent={() => <View style={{ height: 8 }} />}
+          onEndReached={loadMore}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
+          initialNumToRender={10}
+          maxToRenderPerBatch={10}
+          windowSize={5}
+          removeClippedSubviews={true}
         />
       )}
 
@@ -168,8 +212,20 @@ const styles = StyleSheet.create({
     borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, marginTop: 4,
   },
   rangeText: { fontSize: 12, color: Colors.textGray, fontWeight: '600' },
-  summaryTitle: { fontSize: 13, color: Colors.textGray, fontWeight: '600' },
-  summaryAmount: { fontSize: 16, fontWeight: '800', color: Colors.error },
+  // Day header — the Cash Book day-header banner with the day's spend.
+  dayHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    backgroundColor: Colors.bgCard, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
+    borderWidth: 1, borderColor: Colors.border, marginBottom: 8,
+  },
+  dayTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
+  dayCount: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
+  dayRight: { alignItems: 'flex-end' },
+  dayColLabel: { fontSize: 12, fontWeight: '700', textAlign: 'right', marginBottom: 2 },
+  dayColVal: { fontSize: 13, fontWeight: '800', textAlign: 'right', flexShrink: 0 },
+
+  summaryTitle: { fontSize: 13, color: Colors.textGray, fontWeight: '600', flex: 1, marginRight: 12 },
+  summaryAmount: { fontSize: 16, fontWeight: '800', color: Colors.error, flexShrink: 0, textAlign: 'right' },
 
   itemRow: {
     backgroundColor: Colors.bgCard, borderRadius: 14, padding: 14, marginBottom: 10,

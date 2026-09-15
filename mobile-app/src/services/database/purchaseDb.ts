@@ -2,6 +2,8 @@ import { getDatabase } from './db';
 import { writeWithSync } from './syncHelpers';
 import { generateId, nowISO } from './queryHelpers';
 import { addStockMovement, getStockItemsByUserId } from './stockDb';
+import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
+import { parseDateValue } from '../../utils/dates';
 import {
   PurchaseOrder, PurchaseOrderItem,
   PurchaseInvoice, PurchaseInvoiceItem,
@@ -84,6 +86,92 @@ export const getPurchaseOrders = async (userId: string, status?: POStatus): Prom
   if (status) { query += ' AND po.status = ?'; params.push(status); }
   query += ' ORDER BY po.created_at DESC';
   return db.getAllAsync<PurchaseOrder>(query, params);
+};
+
+export type PurchaseFilter = { startDate?: string; endDate?: string; status?: string };
+export type PurchaseDayTotal = { day: string; count: number; total: number; settled: number };
+
+const assertRange = (f: PurchaseFilter) => {
+  for (const date of [f.startDate, f.endDate]) {
+    if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date))) throw new Error('Invalid date range.');
+  }
+  if (f.startDate && f.endDate && f.startDate > f.endDate) throw new Error('From date must not be after To date.');
+};
+
+/** THE one predicate for the Orders tab: rows, header count and day subtotals. */
+const orderWhere = (userId: string, filter: PurchaseFilter) => {
+  assertRange(filter);
+  let where = 'po.user_id = ? AND po.is_deleted = 0';
+  const params: any[] = [userId];
+  if (filter.startDate || filter.endDate) { where += ' AND date(po.order_date) BETWEEN date(?) AND date(?)'; params.push(filter.startDate || '0001-01-01', filter.endDate || '9999-12-31'); }
+  if (filter.status) { where += ' AND po.status = ?'; params.push(filter.status); }
+  return { where, params };
+};
+const ORDER_KEYS = { date: 'po.order_date', createdAt: 'po.created_at', id: 'po.id' } as const;
+
+/**
+ * Orders for a range, paged (keyset on order_date, created_at, id — rows only); the
+ * summary is a SQL aggregate over the whole filtered set.
+ */
+export const getFilteredPurchaseOrders = async (userId: string, filter: PurchaseFilter = {}, limit = -1, after?: PageCursor | null) => {
+  const { where, params } = orderWhere(userId, filter);
+  const db = await getDatabase();
+  const rowsWhere = after ? `${where} AND ${keysetClause(ORDER_KEYS)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after)] : params;
+  const rows = await db.getAllAsync<PurchaseOrder>(
+    `SELECT po.*, s.name as supplier_name FROM purchase_orders po LEFT JOIN suppliers s ON s.id = po.supplier_id
+      WHERE ${rowsWhere} ORDER BY po.order_date DESC, po.created_at DESC, po.id DESC LIMIT ?`, [...rowsParams, limit]
+  );
+  const summary = await db.getFirstAsync<{ count: number; total: number; settled: number }>(
+    `SELECT COUNT(*) AS count, COALESCE(SUM(po.total), 0) AS total, COALESCE(SUM(po.received_total), 0) AS settled
+       FROM purchase_orders po WHERE ${where}`, params
+  );
+  return { rows, summary: summary ?? { count: 0, total: 0, settled: 0 }, nextCursor: nextCursorOf(rows, limit, { date: 'order_date', createdAt: 'created_at', id: 'id' }) };
+};
+
+export const getPurchaseOrderDayTotals = async (userId: string, filter: PurchaseFilter = {}): Promise<PurchaseDayTotal[]> => {
+  const { where, params } = orderWhere(userId, filter);
+  const db = await getDatabase();
+  return db.getAllAsync<PurchaseDayTotal>(
+    `SELECT date(po.order_date) AS day, COUNT(*) AS count, COALESCE(SUM(po.total), 0) AS total, COALESCE(SUM(po.received_total), 0) AS settled
+       FROM purchase_orders po WHERE ${where} GROUP BY date(po.order_date) ORDER BY day DESC`, params
+  );
+};
+
+/** THE one predicate for the Invoices tab. */
+const invoiceWhere = (userId: string, filter: PurchaseFilter) => {
+  assertRange(filter);
+  let where = 'pi.user_id = ? AND pi.is_deleted = 0';
+  const params: any[] = [userId];
+  if (filter.startDate || filter.endDate) { where += ' AND date(pi.invoice_date) BETWEEN date(?) AND date(?)'; params.push(filter.startDate || '0001-01-01', filter.endDate || '9999-12-31'); }
+  if (filter.status) { where += ' AND pi.status = ?'; params.push(filter.status); }
+  return { where, params };
+};
+const INVOICE_KEYS = { date: 'pi.invoice_date', createdAt: 'pi.created_at', id: 'pi.id' } as const;
+
+export const getFilteredPurchaseInvoices = async (userId: string, filter: PurchaseFilter = {}, limit = -1, after?: PageCursor | null) => {
+  const { where, params } = invoiceWhere(userId, filter);
+  const db = await getDatabase();
+  const rowsWhere = after ? `${where} AND ${keysetClause(INVOICE_KEYS)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after)] : params;
+  const rows = await db.getAllAsync<PurchaseInvoice>(
+    `SELECT pi.*, s.name as supplier_name FROM purchase_invoices pi LEFT JOIN suppliers s ON s.id = pi.supplier_id
+      WHERE ${rowsWhere} ORDER BY pi.invoice_date DESC, pi.created_at DESC, pi.id DESC LIMIT ?`, [...rowsParams, limit]
+  );
+  const summary = await db.getFirstAsync<{ count: number; total: number; settled: number }>(
+    `SELECT COUNT(*) AS count, COALESCE(SUM(pi.total), 0) AS total, COALESCE(SUM(pi.amount_paid), 0) AS settled
+       FROM purchase_invoices pi WHERE ${where}`, params
+  );
+  return { rows, summary: summary ?? { count: 0, total: 0, settled: 0 }, nextCursor: nextCursorOf(rows, limit, { date: 'invoice_date', createdAt: 'created_at', id: 'id' }) };
+};
+
+export const getPurchaseInvoiceDayTotals = async (userId: string, filter: PurchaseFilter = {}): Promise<PurchaseDayTotal[]> => {
+  const { where, params } = invoiceWhere(userId, filter);
+  const db = await getDatabase();
+  return db.getAllAsync<PurchaseDayTotal>(
+    `SELECT date(pi.invoice_date) AS day, COUNT(*) AS count, COALESCE(SUM(pi.total), 0) AS total, COALESCE(SUM(pi.amount_paid), 0) AS settled
+       FROM purchase_invoices pi WHERE ${where} GROUP BY date(pi.invoice_date) ORDER BY day DESC`, params
+  );
 };
 
 export const getPurchaseOrderById = async (id: string): Promise<PurchaseOrder | null> => {

@@ -2,6 +2,7 @@ import { getDatabase } from './db';
 import { Expense } from '../../types/expense.types';
 import { writeWithSync } from './syncHelpers';
 import { userScope, userScopeParams } from './queryHelpers';
+import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
 import { parseDateValue, localDate } from '../../utils/dates';
 
 export type ExpenseFilter = {
@@ -11,8 +12,11 @@ export type ExpenseFilter = {
   search?: string;
 };
 
-/** One predicate for both rows and whole-result paisa aggregates. */
-export const getFilteredExpenses = async (userId: string, filter: ExpenseFilter = {}, limit = -1, offset = 0) => {
+/** Per-calendar-day subtotal of the filtered expenses, for the Expense Book's day headers. */
+export type ExpenseDayTotal = { day: string; totalExpense: number; entryCount: number };
+
+/** THE one predicate for the Expense Book: rows, headline total and day subtotals. */
+const expenseWhere = (userId: string, filter: ExpenseFilter) => {
   for (const date of [filter.startDate, filter.endDate]) {
     if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date))) {
       throw new Error('Invalid date range.');
@@ -39,17 +43,48 @@ export const getFilteredExpenses = async (userId: string, filter: ExpenseFilter 
     const needle = search.toLowerCase();
     params.push(needle, needle, needle);
   }
+  return { where, params };
+};
+
+const EXPENSE_KEYS = { date: 'expense_date', createdAt: 'created_at', id: 'id' } as const;
+
+/**
+ * One predicate for both rows and whole-result paisa aggregates. `after` pages the
+ * ROWS only; the total always covers the whole filtered set.
+ */
+export const getFilteredExpenses = async (
+  userId: string, filter: ExpenseFilter = {}, limit = -1, offset = 0, after?: PageCursor | null
+) => {
+  const { where, params } = expenseWhere(userId, filter);
   const db = await getDatabase();
+  const rowsWhere = after ? `${where} AND ${keysetClause(EXPENSE_KEYS)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after)] : params;
   const expenses = await db.getAllAsync<Expense>(
-    `SELECT * FROM expenses WHERE ${where} ORDER BY expense_date DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
+    `SELECT * FROM expenses WHERE ${rowsWhere} ORDER BY expense_date DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    [...rowsParams, limit, offset]
   );
   // amount is integer paisa (v29). Summed by SQL over the WHOLE filtered set, never
   // from the returned page, so the total cannot drift from the list.
   const summary = await db.getFirstAsync<{ totalExpense: number }>(
     `SELECT COALESCE(SUM(amount), 0) as totalExpense FROM expenses WHERE ${where}`, params
   );
-  return { expenses, expenseSummary: { totalExpense: summary?.totalExpense ?? 0 } };
+  return {
+    expenses,
+    expenseSummary: { totalExpense: summary?.totalExpense ?? 0 },
+    nextCursor: nextCursorOf(expenses, limit, EXPENSE_KEYS),
+  };
+};
+
+/** Every calendar day in the filtered set with its SQL subtotal — one query per filter change. */
+export const getExpenseDayTotals = async (userId: string, filter: ExpenseFilter = {}): Promise<ExpenseDayTotal[]> => {
+  const { where, params } = expenseWhere(userId, filter);
+  const db = await getDatabase();
+  return db.getAllAsync<ExpenseDayTotal>(
+    `SELECT date(expense_date) AS day, COALESCE(SUM(amount), 0) AS totalExpense, COUNT(*) AS entryCount
+       FROM expenses WHERE ${where}
+      GROUP BY date(expense_date)
+      ORDER BY day DESC`, params
+  );
 };
 
 export const addExpenseRecord = async (

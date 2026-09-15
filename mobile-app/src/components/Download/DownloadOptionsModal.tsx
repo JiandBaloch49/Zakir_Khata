@@ -5,15 +5,21 @@ import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { useAuthStore } from '../../store/authStore';
 import { useDownloadStore } from '../../store/useDownloadStore';
+import { ReportOptions } from '../../types/download.types';
 import { todayDate, formatDisplayDate } from '../../utils/dates';
 import { DateRangeFilter, DateRange } from '../ui/DateRangeFilter';
-import { REPORT_PRESETS, ReportPreset, presetPeriod, periodSlug } from './reportPeriod';
+import { REPORT_PRESETS, ReportPreset, presetPeriod, periodSlug, initialPeriod } from './reportPeriod';
 
 const ORANGE = '#FF6B35';
 
 export const DownloadOptionsModal = ({ route, navigation }: any) => {
   const { t } = useLanguageStore();
-  const { reportType } = route.params;
+  // `date` (YYYY-MM-DD) is the day a day-view screen was showing when it opened this
+  // sheet — the Cash Book's Day Book — so "daily cash in/out" is the default and the
+  // preset pills / From–To still reach a week, a month or any custom span.
+  // `period` is the range a report screen (Stock IN/OUT) is already showing.
+  const { reportType, date: viewedDay, period: shownPeriod } = route.params as
+    { reportType: ReportOptions['reportType']; date?: string; period?: { startDate?: string; endDate?: string } };
   const { user } = useAuthStore();
   const { isGenerating, generateFile } = useDownloadStore();
 
@@ -24,8 +30,9 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
   // roster with no date dimension, so the control is hidden for it and the
   // document prints "As of today" instead.
   const isRoster = reportType === 'staff';
-  const [preset, setPreset] = useState<ReportPreset>('month');
-  const [range, setRange] = useState<DateRange>(() => presetPeriod('month'));
+  const initial = initialPeriod(viewedDay, shownPeriod);
+  const [preset, setPreset] = useState<ReportPreset>(initial.preset);
+  const [range, setRange] = useState<DateRange>(initial.range);
 
   const choosePreset = (next: ReportPreset) => {
     setPreset(next);

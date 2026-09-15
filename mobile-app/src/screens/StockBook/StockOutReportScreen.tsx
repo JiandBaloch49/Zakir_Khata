@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, TextInput, FlatList, ActivityIndicator, Alert } from 'react-native';
+import React, { useEffect, useState, useMemo } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, TextInput, SectionList, ActivityIndicator, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { useStockStore } from '../../store/useStockStore';
@@ -11,40 +11,99 @@ import { getDisplayName } from '../../utils/displayName';
 import { useSettingsStore } from '../../store/useSettingsStore';
 import { Colors } from '../../theme';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { localDate } from '../../utils/dates';
+import { localDate, toDateValue, formatDisplayDate } from '../../utils/dates';
+import * as Print from 'expo-print';
+import { useDownloadStore } from '../../store/useDownloadStore';
 
 export const StockOutReportScreen = ({ navigation }: any) => {
   const { user } = useAuthStore();
-  const { outReports, loading, fetchOutReports } = useStockStore();
+  const report = useStockStore(s => s.movementReport.out);
+  const fetchMovementReport = useStockStore(s => s.fetchMovementReport);
+  const loadMoreMovementReport = useStockStore(s => s.loadMoreMovementReport);
+  const { rows, summary, dayTotals, loading, loadingMore } = report;
   const { nameDisplayMode } = useSettingsStore();
 
+  const { isGenerating, generateFile } = useDownloadStore();
   const [searchQuery, setSearchQuery] = useState('');
   const [startDate, setStartDate] = useState<Date | null>(null);
   const [endDate, setEndDate] = useState<Date | null>(null);
   
+  // Range AND search are part of the SQL predicate, so the paged rows, the header
+  // totals and the day subtotals always describe the same set.
   useEffect(() => {
     if (user) {
       const startStr = startDate ? localDate(startDate) : undefined;
       const endStr = endDate ? localDate(endDate) : undefined;
-      fetchOutReports(user.id, startStr, endStr);
+      fetchMovementReport(user.id, 'out', { startDate: startStr, endDate: endStr, search: searchQuery });
     }
-  }, [user, startDate, endDate]);
+  }, [user, startDate, endDate, searchQuery]);
+
+  // The range this screen is showing, as the export and print must cover it.
+  const shownPeriod = () => ({
+    startDate: startDate ? localDate(startDate) : undefined,
+    endDate: endDate ? localDate(endDate) : undefined,
+  });
+
+  const handleExport = () => navigation.navigate('DownloadOptionsModal', { reportType: 'stockOut', period: shownPeriod() });
+
+  // Real printing: the same generator builds the PDF, then the OS print dialog opens it.
+  const handlePrint = async () => {
+    if (!user) return;
+    try {
+      const uri = await generateFile({ reportType: 'stockOut', userId: user.id, ...shownPeriod(), format: 'pdf' });
+      await Print.printAsync({ uri });
+    } catch (err: any) {
+      if (__DEV__) console.error('[StockReport] print failed:', err);
+      Alert.alert('Print Failed', err?.message || 'Could not print the report. Please try again.');
+    }
+  };
 
   const handleFilterChange = (filter: DateRangeFilter) => {
     setStartDate(filter.startDate ? new Date(filter.startDate) : null);
     setEndDate(filter.endDate ? new Date(filter.endDate) : null);
   };
 
-  const filteredData = outReports.filter(item => {
-    const nameEn = (item.item_name_en || (item as any).name || (item as any).description || 'Stock Item').toLowerCase();
-    const nameUr = item.item_name_ur?.toLowerCase() || '';
-    const q = searchQuery.toLowerCase();
-    return nameEn.includes(q) || nameUr.includes(q);
-  });
+  // Header totals are the whole-set SQL summary, never a sum of the loaded page.
+  const totalQty = summary.qty;
+  const totalAmount = summary.amount;
 
-  // change is negative for OUT, so we take Math.abs
-  const totalQty = filteredData.reduce((sum, item) => sum + Math.abs(item.change), 0);
-  const totalAmount = filteredData.reduce((sum, item) => sum + (Math.abs(item.change) * (item.sale_price_unit || item.cost_per_unit || 0)), 0);
+  // Loaded movements grouped by day; a day straddling a page boundary keeps ONE
+  // section whose header shows the day's whole SQL subtotal.
+  const sections = useMemo(() => {
+    const byDay = new Map<string, StockReportEntry[]>();
+    for (const m of rows) {
+      const day = toDateValue(m.date) || String(m.date);
+      const list = byDay.get(day);
+      if (list) list.push(m); else byDay.set(day, [m]);
+    }
+    return [...byDay.entries()].map(([day, data]) => ({ day, data }));
+  }, [rows]);
+
+  const renderSectionHeader = ({ section }: { section: { day: string } }) => {
+    const t = dayTotals[section.day];
+    return (
+      <View style={styles.dayHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
+          {t && <Text style={styles.dayCount}>{t.entries} {t.entries === 1 ? 'Entry' : 'Entries'}</Text>}
+        </View>
+        {t && (
+          <View style={styles.dayRight}>
+            <View style={styles.dayCols}>
+              <Text style={[styles.dayColLabel, { color: Colors.error }]}>Qty OUT</Text>
+              <Text style={[styles.dayColLabel, { color: Colors.textGray }]}>Amount</Text>
+            </View>
+            <View style={styles.dayCols}>
+              <Text style={[styles.dayColVal, { color: Colors.error }]}>{t.qty}</Text>
+              <Text style={[styles.dayColVal, { color: Colors.error }]}>{formatCurrency(t.amount)}</Text>
+            </View>
+          </View>
+        )}
+      </View>
+    );
+  };
+
+  const loadMore = () => { if (user) loadMoreMovementReport(user.id, 'out'); };
 
   const renderItem = ({ item }: { item: StockReportEntry }) => {
     const qty = Math.abs(item.change);
@@ -105,7 +164,7 @@ export const StockOutReportScreen = ({ navigation }: any) => {
             <Text style={{ color: Colors.error, fontSize: 16, fontWeight: 'bold' }}>↑</Text>
             <View style={{ marginLeft: 4 }}>
               <Text style={styles.thText}>Entries</Text>
-              <Text style={[styles.thSubText, { color: Colors.textWhite }]}>{filteredData.length}</Text>
+              <Text style={[styles.thSubText, { color: Colors.textWhite }]}>{summary.entries}</Text>
             </View>
           </View>
           <View style={styles.cellQty}>
@@ -127,12 +186,21 @@ export const StockOutReportScreen = ({ navigation }: any) => {
             <ActivityIndicator size="large" color={Colors.primary} />
           </View>
         ) : (
-          <FlatList
-            data={filteredData}
+          <SectionList
+            sections={sections}
             keyExtractor={(item) => item.id}
             renderItem={renderItem}
+            renderSectionHeader={renderSectionHeader}
+            stickySectionHeadersEnabled
             style={{ flex: 1 }}
             contentContainerStyle={{ paddingBottom: 16 }}
+            onEndReached={loadMore}
+            onEndReachedThreshold={0.5}
+            ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
+            initialNumToRender={10}
+            maxToRenderPerBatch={10}
+            windowSize={5}
+            removeClippedSubviews={true}
             ListEmptyComponent={
               <View style={styles.center}>
                 <Text style={{ color: Colors.textGray, marginTop: 40 }}>No stock out entries found.</Text>
@@ -143,10 +211,10 @@ export const StockOutReportScreen = ({ navigation }: any) => {
 
         {/* Footer Export Buttons */}
         <View style={styles.footer}>
-          <TouchableOpacity style={styles.pdfBtn} onPress={() => Alert.alert('Export PDF', 'This feature is coming soon.')}>
+          <TouchableOpacity style={styles.pdfBtn} onPress={handleExport} disabled={isGenerating}>
             <Text style={styles.pdfBtnText}>📄 PDF Report</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.printBtn} onPress={() => Alert.alert('Print', 'This feature is coming soon.')}>
+          <TouchableOpacity style={styles.printBtn} onPress={handlePrint} disabled={isGenerating}>
             <Text style={styles.printBtnText}>🖨️</Text>
           </TouchableOpacity>
         </View>
@@ -214,5 +282,18 @@ const styles = StyleSheet.create({
     width: 48, height: 48, borderRadius: 24, backgroundColor: Colors.warning,
     justifyContent: 'center', alignItems: 'center',
   },
-  printBtnText: { fontSize: 22 }
+  printBtnText: { fontSize: 22 },
+
+  // Day header — the Cash Book day-header banner with Qty / Amount for the day.
+  dayHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    backgroundColor: Colors.bgCard, paddingVertical: 10, paddingHorizontal: 14,
+    borderBottomWidth: 1, borderColor: Colors.border,
+  },
+  dayTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
+  dayCount: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
+  dayRight: { alignItems: 'flex-end' },
+  dayCols: { flexDirection: 'row', gap: 16 },
+  dayColLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right', marginBottom: 2 },
+  dayColVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
 });

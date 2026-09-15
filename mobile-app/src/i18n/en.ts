@@ -113,7 +113,8 @@ export const en = {
   "country8": "Kuwait",
   "country9": "Bahrain",
   "country10": "Malaysia",
-  "country11": "Indonesia"
+  "country11": "Indonesia",
+  "photoOf": "Photo of {name}"
 } as const;
 
 export type TKey = keyof typeof en;

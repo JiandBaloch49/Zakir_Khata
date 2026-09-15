@@ -8,7 +8,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { useAuthStore } from '../../store/authStore';
 import { useBillStore } from '../../store/useBillStore';
 import { getStockItemsByUserId, addStockMovement } from '../../services/database/stockDb';
-import { getCustomers, addCustomer } from '../../services/database/customerDb';
+import { searchCustomers, addCustomer, CustomerCursor } from '../../services/database/customerDb';
 import { StockItem } from '../../types/stock.types';
 import { Customer } from '../../services/database/customerDb';
 import { SelectItemsModal } from './SelectItemsModal';
@@ -29,6 +29,9 @@ export const CreateNewBillModal = ({ navigation }: any) => {
 
   const [stockItems, setStockItems] = useState<StockItem[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [customerQuery, setCustomerQuery] = useState('');
+  const [customerCursor, setCustomerCursor] = useState<CustomerCursor | null>(null);
+  const [customerLoadingMore, setCustomerLoadingMore] = useState(false);
   
   // Form State
   const [billNumber, setBillNumber] = useState('');
@@ -49,6 +52,30 @@ export const CreateNewBillModal = ({ navigation }: any) => {
   const [newPartyName, setNewPartyName] = useState('');
   const [newPartyPhone, setNewPartyPhone] = useState('');
   const [creatingParty, setCreatingParty] = useState(false);
+
+  // Picker search: SQL, bounded — typing narrows by query, not by filtering an array.
+  useEffect(() => {
+    let active = true;
+    if (!user?.id || !showCustomerModal) return;
+    searchCustomers(user.id, customerQuery, 50)
+      .then(page => { if (active) { setCustomers(page.rows); setCustomerCursor(page.nextCursor); } })
+      .catch(e => { if (__DEV__) console.error('[CreateBill] customer search failed:', e); });
+    return () => { active = false; };
+  }, [user?.id, customerQuery, showCustomerModal]);
+
+  const loadMoreCustomers = async () => {
+    if (!user?.id || !customerCursor || customerLoadingMore) return;
+    setCustomerLoadingMore(true);
+    try {
+      const page = await searchCustomers(user.id, customerQuery, 50, customerCursor);
+      setCustomers(prev => [...prev, ...page.rows]);
+      setCustomerCursor(page.nextCursor);
+    } catch (e) {
+      if (__DEV__) console.error('[CreateBill] customer page failed:', e);
+    } finally {
+      setCustomerLoadingMore(false);
+    }
+  };
 
   const handleCreateNewParty = async () => {
     if (!newPartyName.trim() || !user?.id) {
@@ -88,8 +115,10 @@ export const CreateNewBillModal = ({ navigation }: any) => {
     try {
       const items = await getStockItemsByUserId(userId);
       setStockItems(items);
-      const custs = await getCustomers(userId);
-      setCustomers(custs);
+      // Customers: first page only; the picker's search box narrows via SQL.
+      const page = await searchCustomers(userId, '', 50);
+      setCustomers(page.rows);
+      setCustomerCursor(page.nextCursor);
     } catch (e) {
       console.error(e);
     }
@@ -349,6 +378,13 @@ export const CreateNewBillModal = ({ navigation }: any) => {
               </View>
             )}
 
+            <TextInput
+              style={{ backgroundColor: Colors.bgSecondary, color: Colors.textWhite, padding: 10, borderRadius: 8, marginBottom: 8, borderWidth: 1, borderColor: Colors.border }}
+              placeholder="Search customer by name or phone"
+              placeholderTextColor={Colors.textGray}
+              value={customerQuery}
+              onChangeText={setCustomerQuery}
+            />
             <TouchableOpacity 
               style={[styles.customerItem, !selectedCustomer && { backgroundColor: Colors.bgInput }]}
               onPress={() => { setSelectedCustomer(null); setShowCustomerModal(false); }}
@@ -358,6 +394,10 @@ export const CreateNewBillModal = ({ navigation }: any) => {
             <FlatList
               data={customers}
               keyExtractor={i => i.id}
+              onEndReached={loadMoreCustomers}
+              onEndReachedThreshold={0.5}
+              ListFooterComponent={customerLoadingMore ? <ActivityIndicator style={{ margin: 12 }} color={Colors.primary} /> : null}
+              keyboardShouldPersistTaps="handled"
               renderItem={({ item }) => (
                 <TouchableOpacity 
                   style={[styles.customerItem, selectedCustomer?.id === item.id && { backgroundColor: Colors.bgInput }]}

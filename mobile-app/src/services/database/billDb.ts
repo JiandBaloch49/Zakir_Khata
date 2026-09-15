@@ -3,6 +3,7 @@ import { assertAllowedUpdateFields } from './updateFields';
 import { Bill, BillItem } from '../../types/bill.types';
 import { writeWithSync } from './syncHelpers';
 import { userScope, userScopeParams } from './queryHelpers';
+import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
 import { parseDateValue, toDateValue } from '../../utils/dates';
 
 export const createBill = async (
@@ -130,8 +131,11 @@ export type BillFilter = {
   search?: string;
 };
 
-/** One predicate for both rows and whole-result paisa aggregates. */
-export const getFilteredBills = async (userId: string, filter: BillFilter = {}, limit = -1, offset = 0) => {
+/** Per-calendar-day subtotal of the filtered bills, for the Bill Book's day headers. */
+export type BillDayTotal = { day: string; billCount: number; totalBilled: number; totalPaid: number; totalDue: number };
+
+/** THE one predicate for the Bill Book: rows, headline summary and day subtotals. */
+const billWhere = (userId: string, filter: BillFilter) => {
   for (const date of [filter.startDate, filter.endDate]) {
     if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date))) {
       throw new Error('Invalid date range.');
@@ -158,18 +162,48 @@ export const getFilteredBills = async (userId: string, filter: BillFilter = {}, 
                  OR instr(COALESCE(CAST(bill_no AS TEXT), ''), ?) > 0)`;
     params.push(search.toLowerCase(), search, search);
   }
+  return { where, params };
+};
 
-  const db = await getDatabase();
-  const bills = await db.getAllAsync<any>(
-    `SELECT * FROM bills WHERE ${where} ORDER BY bill_date DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
-  );
+const BILL_KEYS = { date: 'bill_date', createdAt: 'created_at', id: 'id' } as const;
+
+/** Items for a set of bills in ONE query per chunk (was one query per bill). */
+const attachBillItems = async (db: Awaited<ReturnType<typeof getDatabase>>, bills: any[]) => {
   for (const b of bills) {
-    if (b.attachment_urls) b.attachment_urls = JSON.parse(b.attachment_urls);
-    b.items = await db.getAllAsync<BillItem>(
-      'SELECT * FROM bill_items WHERE bill_id = ? AND is_deleted = 0', [b.id]
-    );
+    if (b.attachment_urls && typeof b.attachment_urls === 'string') b.attachment_urls = JSON.parse(b.attachment_urls);
+    b.items = [];
   }
+  const byId = new Map<string, any>(bills.map(b => [b.id, b]));
+  const ids = [...byId.keys()];
+  for (let i = 0; i < ids.length; i += 400) {
+    const chunk = ids.slice(i, i + 400);
+    const items = await db.getAllAsync<BillItem>(
+      `SELECT * FROM bill_items WHERE is_deleted = 0 AND bill_id IN (${chunk.map(() => '?').join(',')}) ORDER BY rowid`, chunk
+    );
+    for (const it of items) byId.get(it.bill_id)?.items.push(it);
+  }
+};
+
+/**
+ * One predicate for both rows and whole-result paisa aggregates.
+ *
+ * Paging: pass `after` for the next `limit` bills in `bill_date DESC, created_at
+ * DESC, id DESC` order. The cursor is applied to the ROWS query ONLY — billSummary
+ * always covers the whole filtered set. Items are fetched with one IN (…) query per
+ * page, not one query per bill.
+ */
+export const getFilteredBills = async (
+  userId: string, filter: BillFilter = {}, limit = -1, offset = 0, after?: PageCursor | null
+) => {
+  const { where, params } = billWhere(userId, filter);
+  const db = await getDatabase();
+  const rowsWhere = after ? `${where} AND ${keysetClause(BILL_KEYS)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after)] : params;
+  const bills = await db.getAllAsync<any>(
+    `SELECT * FROM bills WHERE ${rowsWhere} ORDER BY bill_date DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    [...rowsParams, limit, offset]
+  );
+  await attachBillItems(db, bills);
 
   // total/paid/due are integer paisa (v29), summed by SQL over the WHOLE filtered
   // set — never from the returned page, so the headline cannot drift from the list.
@@ -181,7 +215,27 @@ export const getFilteredBills = async (userId: string, filter: BillFilter = {}, 
        FROM bills WHERE ${where}`, params
   );
   const { billCount = 0, totalBilled = 0, totalPaid = 0, totalDue = 0 } = summary || {};
-  return { bills: bills as Bill[], billSummary: { billCount, totalBilled, totalPaid, totalDue } };
+  return {
+    bills: bills as Bill[],
+    billSummary: { billCount, totalBilled, totalPaid, totalDue },
+    nextCursor: nextCursorOf(bills, limit, BILL_KEYS),
+  };
+};
+
+/**
+ * Every calendar day in the filtered set with its own SQL subtotal — ONE query per
+ * filter change, never per page, never a sum of loaded rows.
+ */
+export const getBillDayTotals = async (userId: string, filter: BillFilter = {}): Promise<BillDayTotal[]> => {
+  const { where, params } = billWhere(userId, filter);
+  const db = await getDatabase();
+  return db.getAllAsync<BillDayTotal>(
+    `SELECT date(bill_date) AS day, COUNT(*) AS billCount,
+            COALESCE(SUM(total), 0) AS totalBilled, COALESCE(SUM(paid), 0) AS totalPaid, COALESCE(SUM(due), 0) AS totalDue
+       FROM bills WHERE ${where}
+      GROUP BY date(bill_date)
+      ORDER BY day DESC`, params
+  );
 };
 
 /** True when a bill would appear under the given filter — used to tell the user
@@ -219,18 +273,8 @@ export const getBillsByUserId = async (
   query += ' ORDER BY created_at DESC';
 
   const bills = await db.getAllAsync<any>(query, params);
-  
-  // Attach items (for a lightweight list this might be skipped, but we'll include it)
-  for (const b of bills) {
-    if (b.attachment_urls) {
-      b.attachment_urls = JSON.parse(b.attachment_urls);
-    }
-    const items = await db.getAllAsync<BillItem>(
-      'SELECT * FROM bill_items WHERE bill_id = ? AND is_deleted = 0',
-      [b.id]
-    );
-    b.items = items;
-  }
+  // Items in one IN (…) query per chunk, same as getFilteredBills — not one per bill.
+  await attachBillItems(db, bills);
 
   return bills as Bill[];
 };

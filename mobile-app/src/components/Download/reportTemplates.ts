@@ -97,6 +97,36 @@ export const STOCK_REPORT_TEMPLATE = `
 </html>
 `;
 
+// Stock IN / Stock OUT: one movement per row — the same rows the report screens list.
+// {{direction}} is "IN" or "OUT" so the document is unmistakably one or the other.
+export const STOCK_MOVEMENT_TEMPLATE = `
+<html>
+<head>
+  <style>
+    ${BASE_STYLE}
+    .header h1 { color: #F59E0B; }
+    .in { color: #16A34A; } .out { color: #DC2626; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>{{business_name}}</h1>
+    <p>Stock {{direction}} Report</p>
+  </div>
+  <p>Period: {{period}}</p>
+  <table>
+    <tr><th>Item</th><th>Date</th><th class="num">Qty {{direction}}</th><th class="num">Rate</th><th class="num">Amount</th></tr>
+    {{rows}}
+  </table>
+  <div class="summary">
+    <p>Entries: <strong>{{entries}}</strong></p>
+    <p>Total Qty {{direction}}: <strong>{{totalQty}}</strong></p>
+    <p>Total Amount ({{amountLabel}}): <strong>{{totalAmount}}</strong></p>
+  </div>
+</body>
+</html>
+`;
+
 export const BILL_REPORT_TEMPLATE = `
 <html>
 <head>

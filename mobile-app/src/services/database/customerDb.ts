@@ -163,6 +163,39 @@ export const getCustomerByName = async (userId: string, name: string): Promise<C
   return result ?? null;
 };
 
+export type CustomerCursor = { name: string; id: string };
+
+/**
+ * Customers matching `query` (name or phone, literal substring, case-insensitive),
+ * alphabetically, `limit` at a time. `after` is the last row of the previous page,
+ * so typing narrows via SQL and a long list never has to be loaded whole. The
+ * count covers the WHOLE match, not the page. CNIC is redacted exactly as in every
+ * other read. Used by the Customer Book and by the Add Transaction / Create Bill
+ * pickers — the hottest path in the app — so the initial load is bounded too.
+ */
+export const searchCustomers = async (
+  userId: string, query = '', limit = 50, after?: CustomerCursor | null
+): Promise<{ rows: Customer[]; total: number; nextCursor: CustomerCursor | null }> => {
+  const db = await getDatabase();
+  let where = `(user_id = ? OR user_id IN (SELECT id FROM users WHERE parentId = ?) OR user_id IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?)))
+       AND is_deleted = 0`;
+  const params: any[] = [userId, userId, userId];
+  const needle = query.trim().toLowerCase();
+  if (needle) {
+    // Literal substring on name or phone — %, _ and quotes are text, never wildcards.
+    where += " AND (instr(lower(COALESCE(name, '')), ?) > 0 OR instr(COALESCE(phone, ''), ?) > 0)";
+    params.push(needle, needle);
+  }
+  const rowsWhere = after ? `${where} AND (lower(name) > ? OR (lower(name) = ? AND id > ?))` : where;
+  const rowsParams = after ? [...params, after.name.toLowerCase(), after.name.toLowerCase(), after.id] : params;
+  const rows = await redactCnic(userId, await db.getAllAsync<Customer>(
+    `SELECT * FROM customers WHERE ${rowsWhere} ORDER BY lower(name) ASC, id ASC LIMIT ?`, [...rowsParams, limit]
+  ));
+  const count = await db.getFirstAsync<{ n: number }>(`SELECT COUNT(*) AS n FROM customers WHERE ${where}`, params);
+  const last = rows[rows.length - 1];
+  return { rows, total: count?.n ?? 0, nextCursor: limit > 0 && rows.length === limit && last ? { name: last.name, id: last.id } : null };
+};
+
 export const getCustomers = async (userId: string): Promise<Customer[]> => {
   const db = await getDatabase();
   return redactCnic(userId, await db.getAllAsync<Customer>(

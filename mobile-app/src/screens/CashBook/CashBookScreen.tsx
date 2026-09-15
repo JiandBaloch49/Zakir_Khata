@@ -204,10 +204,22 @@ export const CashBookScreen = ({ navigation }: any) => {
       {/* Top Header with Profile & Books Bar */}
       <TopHeaderWithBooks navigation={navigation} activeBook="CashBook" />
 
+      {/* Sub Header — same row and button as the Bill Book. The export opens on the day
+          being viewed; the sheet's presets still offer a week, a month or a custom span. */}
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10 }}>
+        <Text style={{ fontSize: 18, fontWeight: '800', color: '#fff' }}>Cash Book</Text>
+        <TouchableOpacity
+          style={{ padding: 6 }}
+          onPress={() => navigation.navigate('DownloadOptionsModal', { reportType: 'cash', date: viewDate })}
+        >
+          <Text style={{ fontSize: 14, fontWeight: '800', color: '#1dd1a1' }}>⬇ PDF Report</Text>
+        </TouchableOpacity>
+      </View>
+
       {/* Summary Card Header */}
       <View style={styles.summaryCard}>
         <View style={styles.summaryCol}>
-          <Text style={[styles.summaryVal, { color: Colors.success }]}>
+          <Text style={[styles.summaryVal, { color: Colors.success }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
             {formatCurrency(cashSummary.cashBalance || 0)}
           </Text>
           <Text style={styles.summarySubLabel}>Cash in Hand (all time)</Text>
@@ -216,7 +228,7 @@ export const CashBookScreen = ({ navigation }: any) => {
         <View style={styles.summaryDivider} />
 
         <View style={styles.summaryCol}>
-          <Text style={[styles.summaryVal, { color: todayBalancePaisa >= 0 ? Colors.success : Colors.error }]}>
+          <Text style={[styles.summaryVal, { color: todayBalancePaisa >= 0 ? Colors.success : Colors.error }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
             {formatCurrency(todayBalancePaisa)}
           </Text>
           <Text style={styles.summarySubLabel}>{isToday ? 'Today Balance' : 'Day Balance'}</Text>
@@ -351,7 +363,7 @@ export const CashBookScreen = ({ navigation }: any) => {
         <View style={[styles.actionRow, { marginBottom: 85 + Math.max(insets.bottom, 8) }]}>
           <TouchableOpacity
             style={styles.cashBtnWrap}
-            onPress={() => navigation.navigate('CashOutModal')}
+            onPress={() => navigation.navigate('CashOutModal', { mode: 'out', date: viewDate })}
             activeOpacity={0.85}
           >
             <LinearGradient
@@ -366,7 +378,7 @@ export const CashBookScreen = ({ navigation }: any) => {
 
           <TouchableOpacity
             style={styles.cashBtnWrap}
-            onPress={() => navigation.navigate('CashInModal')}
+            onPress={() => navigation.navigate('CashInModal', { mode: 'in', date: viewDate })}
             activeOpacity={0.85}
           >
             <LinearGradient
@@ -449,8 +461,8 @@ const styles = StyleSheet.create({
   dateHeaderRight: { alignItems: 'flex-end' },
   totalsHeaderRow: { flexDirection: 'row', gap: 16, marginBottom: 2 },
   totalsValueRow: { flexDirection: 'row', gap: 16 },
-  columnLabel: { fontSize: 12, fontWeight: '700', width: 60, textAlign: 'right' },
-  columnVal: { fontSize: 13, fontWeight: '800', width: 60, textAlign: 'right' },
+  columnLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right' },
+  columnVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
 
   entryRow: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
@@ -465,9 +477,9 @@ const styles = StyleSheet.create({
   },
   chipText: { fontSize: 12, color: Colors.textWhite, fontWeight: '600' },
 
-  entryAmountsRight: { flexDirection: 'row', gap: 16, alignItems: 'center' },
-  amountCol: { width: 60, alignItems: 'flex-end', justifyContent: 'center' },
-  entryAmount: { fontSize: 15, fontWeight: '800', textAlign: 'right' },
+  entryAmountsRight: { flexDirection: 'row', gap: 16, alignItems: 'center', flexShrink: 0 },
+  amountCol: { minWidth: 60, alignItems: 'flex-end', justifyContent: 'center' },
+  entryAmount: { fontSize: 15, fontWeight: '800', textAlign: 'right', flexShrink: 0 },
 
   emptyContainer: { alignItems: 'center', justifyContent: 'center', paddingVertical: 48 },
   emptyIcon: { fontSize: 44, marginBottom: 10 },

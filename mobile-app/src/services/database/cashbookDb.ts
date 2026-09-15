@@ -4,6 +4,7 @@ import { CashEntry } from '../../types';
 import { writeWithSync } from './syncHelpers';
 import { todayDate, parseDateValue } from '../../utils/dates';
 import { userScope, userScopeParams } from './queryHelpers';
+import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
 
 export type CashHistoryFilter = {
   startDate?: string;
@@ -12,8 +13,14 @@ export type CashHistoryFilter = {
   search?: string;
 };
 
-/** One predicate for both rows and whole-result paisa aggregates. */
-export const getFilteredCashHistory = async (userId: string, filter: CashHistoryFilter = {}, limit = -1, offset = 0) => {
+/** Per-calendar-day subtotal of the filtered set, for the history list's day headers. */
+export type CashDayTotal = { day: string; cashIn: number; cashOut: number; entryCount: number };
+
+/**
+ * THE one predicate for Cash History: the rows, the headline summary and the
+ * per-day subtotals all come from here, so none of them can disagree.
+ */
+const cashHistoryWhere = (userId: string, filter: CashHistoryFilter) => {
   for (const date of [filter.startDate, filter.endDate]) {
     if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date))) {
       throw new Error('Invalid date range.');
@@ -37,10 +44,27 @@ export const getFilteredCashHistory = async (userId: string, filter: CashHistory
     where += " AND instr(lower(COALESCE(description, '')), ?) > 0";
     params.push(search.toLowerCase());
   }
+  return { where, params };
+};
+
+/**
+ * One predicate for both rows and whole-result paisa aggregates.
+ *
+ * Paging: pass `after` (the cursor from the previous page) to get the next
+ * `limit` rows in the same `date DESC, createdAt DESC, id DESC` order. The cursor
+ * clause is applied to the ROWS query ONLY — cashSummary always covers the whole
+ * filtered set, whichever page this is. `limit/offset` remain for existing callers.
+ */
+export const getFilteredCashHistory = async (
+  userId: string, filter: CashHistoryFilter = {}, limit = -1, offset = 0, after?: PageCursor | null
+) => {
+  const { where, params } = cashHistoryWhere(userId, filter);
   const db = await getDatabase();
+  const rowsWhere = after ? `${where} AND ${keysetClause(CASH_KEYS)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after)] : params;
   const entries = await db.getAllAsync<CashEntry>(
-    `SELECT * FROM cashbook WHERE ${where} ORDER BY date DESC, createdAt DESC, id DESC LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
+    `SELECT * FROM cashbook WHERE ${rowsWhere} ORDER BY date DESC, createdAt DESC, id DESC LIMIT ? OFFSET ?`,
+    [...rowsParams, limit, offset]
   );
   const summary = await db.getFirstAsync<{ cashIn: number; cashOut: number }>(
     `SELECT COALESCE(SUM(CASE WHEN direction = 'in' THEN amount_paisa ELSE 0 END), 0) as cashIn,
@@ -48,7 +72,32 @@ export const getFilteredCashHistory = async (userId: string, filter: CashHistory
      FROM cashbook WHERE ${where}`, params
   );
   const { cashIn = 0, cashOut = 0 } = summary || {};
-  return { entries, cashSummary: { cashIn, cashOut, cashBalance: cashIn - cashOut } };
+  return {
+    entries,
+    cashSummary: { cashIn, cashOut, cashBalance: cashIn - cashOut },
+    nextCursor: nextCursorOf(entries, limit, CASH_KEYS),
+  };
+};
+const CASH_KEYS = { date: 'date', createdAt: 'createdAt', id: 'id' } as const;
+
+/**
+ * Every calendar day in the filtered set with its own SQL subtotal — ONE query per
+ * filter change (≤ 366 rows a year), never per page and never a sum of loaded rows.
+ * A day header therefore shows the day's whole figure even while only some of its
+ * rows are on screen. Keyed by date(date) so legacy timestamp rows fall on their day.
+ */
+export const getCashHistoryDayTotals = async (userId: string, filter: CashHistoryFilter = {}): Promise<CashDayTotal[]> => {
+  const { where, params } = cashHistoryWhere(userId, filter);
+  const db = await getDatabase();
+  return db.getAllAsync<CashDayTotal>(
+    `SELECT date(date) AS day,
+            COALESCE(SUM(CASE WHEN direction = 'in' THEN amount_paisa ELSE 0 END), 0) AS cashIn,
+            COALESCE(SUM(CASE WHEN direction = 'out' THEN amount_paisa ELSE 0 END), 0) AS cashOut,
+            COUNT(*) AS entryCount
+       FROM cashbook WHERE ${where}
+      GROUP BY date(date)
+      ORDER BY day DESC`, params
+  );
 };
 
 export type { CashEntry };

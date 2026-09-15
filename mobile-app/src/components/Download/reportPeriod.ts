@@ -1,4 +1,4 @@
-import { localDate, toDateValue, formatDisplayDate } from '../../utils/dates';
+import { localDate, toDateValue, formatDisplayDate, todayDate, isValidDateValue } from '../../utils/dates';
 
 /**
  * The period a report covers. Both ends are optional YYYY-MM-DD values, exactly
@@ -67,4 +67,22 @@ export const periodSlug = ({ startDate, endDate }: ReportPeriod): string => {
   if (!startDate && !endDate) return 'all-dates';
   if (startDate && endDate) return `${startDate}_to_${endDate}`;
   return startDate ? `from_${startDate}` : `to_${endDate}`;
+};
+
+/**
+ * Starting period for the download sheet. A day-view screen (the Cash Book's Day Book)
+ * passes the day it is showing: that day exports as the "Today" preset when it is today,
+ * otherwise as a Custom day-to-day range. With no day given, the month the books open on.
+ */
+export const initialPeriod = (viewedDay?: string, period?: ReportPeriod): { preset: ReportPreset; range: ReportPeriod } => {
+  // A report screen hands over the range it is showing (either end may be open).
+  if (period && (period.startDate || period.endDate)) {
+    const clean = resolvePeriod(period);
+    return { preset: 'custom', range: clean };
+  }
+  if (viewedDay && isValidDateValue(viewedDay)) {
+    if (viewedDay === todayDate()) return { preset: 'today', range: presetPeriod('today') };
+    return { preset: 'custom', range: { startDate: viewedDay, endDate: viewedDay } };
+  }
+  return { preset: 'month', range: presetPeriod('month') };
 };

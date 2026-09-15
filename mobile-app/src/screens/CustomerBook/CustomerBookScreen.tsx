@@ -5,7 +5,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
-import { getCustomers, addCustomer, updateCustomer, customerPhotoUri, canViewCnic, Customer } from '../../services/database/customerDb';
+import { searchCustomers, addCustomer, updateCustomer, customerPhotoUri, canViewCnic, Customer, CustomerCursor } from '../../services/database/customerDb';
+import { PAGE_SIZE } from '../../services/database/pagination';
 import { Colors } from '../../theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
 import { CustomerAvatar } from '../../components/ui/CustomerAvatar';
@@ -15,6 +16,9 @@ export const CustomerBookScreen = ({ navigation }: any) => {
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [total, setTotal] = useState(0);
+  const [cursor, setCursor] = useState<CustomerCursor | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -47,12 +51,16 @@ export const CustomerBookScreen = ({ navigation }: any) => {
     setModalVisible(true);
   };
 
+  // Search runs in SQL and the list is paged, so a shop with thousands of customers
+  // never loads them all; the count is the SQL count of the whole match.
   const fetchCustomers = async () => {
     if (!user?.id) return;
     try {
       setLoading(true);
-      const data = await getCustomers(user.id);
-      setCustomers(data);
+      const page = await searchCustomers(user.id, searchQuery, PAGE_SIZE);
+      setCustomers(page.rows);
+      setTotal(page.total);
+      setCursor(page.nextCursor);
     } catch (err) {
       if (__DEV__) console.error(err);
     } finally {
@@ -60,8 +68,25 @@ export const CustomerBookScreen = ({ navigation }: any) => {
     }
   };
 
+  const loadMore = async () => {
+    if (!user?.id || !cursor || loadingMore || loading) return;
+    setLoadingMore(true);
+    try {
+      const page = await searchCustomers(user.id, searchQuery, PAGE_SIZE, cursor);
+      setCustomers(prev => [...prev, ...page.rows]);
+      setCursor(page.nextCursor);
+    } catch (err) {
+      if (__DEV__) console.error(err);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
   useEffect(() => {
     fetchCustomers();
+  }, [user?.id, searchQuery]);
+
+  useEffect(() => {
     if (user?.id) canViewCnic(user.id).then(setShowCnic).catch(() => setShowCnic(false));
   }, [user?.id]);
 
@@ -99,7 +124,7 @@ export const CustomerBookScreen = ({ navigation }: any) => {
           await updateCustomer(newCust.id, user.id, { photo_local_path: durable });
           newCust.photo_local_path = durable;
         }
-        setCustomers(prev => [newCust, ...prev]);
+        await fetchCustomers();
         Alert.alert('Success', 'Customer added successfully!');
       }
       setModalVisible(false);
@@ -111,10 +136,7 @@ export const CustomerBookScreen = ({ navigation }: any) => {
     }
   };
 
-  const filteredCustomers = customers.filter(c => {
-    const q = searchQuery.toLowerCase();
-    return c.name.toLowerCase().includes(q) || (c.phone && c.phone.includes(q));
-  });
+  const filteredCustomers = customers;
 
   const renderCustomerItem = ({ item }: { item: Customer }) => {
     const place = [item.address, item.city].filter(Boolean).join(', ');
@@ -144,7 +166,7 @@ export const CustomerBookScreen = ({ navigation }: any) => {
 
       {/* Sub Header */}
       <View style={styles.subHeader}>
-        <Text style={styles.subHeaderTitle}>Customer Book ({filteredCustomers.length})</Text>
+        <Text style={styles.subHeaderTitle}>Customer Book ({total})</Text>
         <TouchableOpacity
           style={styles.addBtnHeader}
           onPress={openAdd}
@@ -187,6 +209,9 @@ export const CustomerBookScreen = ({ navigation }: any) => {
           keyExtractor={(item) => item.id}
           renderItem={renderCustomerItem}
           contentContainerStyle={styles.listContent}
+          onEndReached={loadMore}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
         />
       )}
 

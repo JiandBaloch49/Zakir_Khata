@@ -13,7 +13,7 @@ const ORANGE = '#FF6B35';
 
 export const ActivityLogScreen = ({ navigation }: any) => {
   const { user } = useAuthStore();
-  const { activities, loading, fetchActivities } = useActivityStore();
+  const { activities, loading, loadingMore, cursor, fetchActivities, loadMoreActivities } = useActivityStore();
 
   const [auditRows, setAuditRows] = useState<EntryAuditRow[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -34,9 +34,14 @@ export const ActivityLogScreen = ({ navigation }: any) => {
     return () => { active = false; };
   }, [user?.id, fetchActivities]));
   type FeedItem = { id: string; timestamp: string; activity?: ActivityLog; audit?: EntryAuditRow[] };
+  // Activities are paged (oldest loaded = the page boundary); audit groups are merged in
+  // only down to that boundary so the feed stays in one chronological sequence while
+  // older activity is still being loaded. Once the last page is in, everything shows.
+  const oldestLoaded = cursor ? activities[activities.length - 1]?.timestamp ?? '' : '';
   const feed: FeedItem[] = [
     ...activities.map(activity => ({ id: activity.id, timestamp: activity.timestamp, activity })),
-    ...groupAuditRows(auditRows).map(audit => ({ id: audit[0].change_group_id, timestamp: audit[0].changed_at, audit })),
+    ...groupAuditRows(auditRows).map(audit => ({ id: audit[0].change_group_id, timestamp: audit[0].changed_at, audit }))
+      .filter(item => !oldestLoaded || item.timestamp >= oldestLoaded),
   ].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 
   const getEntityIcon = (type: string) => {
@@ -118,6 +123,9 @@ export const ActivityLogScreen = ({ navigation }: any) => {
             </TouchableOpacity>
           ) : renderItem({ item: item.activity! })}
           contentContainerStyle={{ padding: 12 }}
+          onEndReached={() => { if (user) loadMoreActivities(user.id); }}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={ORANGE} /> : null}
         />
       )}
       {selected && <EntryHistoryModal table={selected.book_table} entryId={selected.entry_id} visible={true} onClose={() => setSelected(null)} />}

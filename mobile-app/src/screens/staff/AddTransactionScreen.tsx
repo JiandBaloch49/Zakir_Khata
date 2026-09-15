@@ -3,7 +3,7 @@ import { View, Text, TextInput, TouchableOpacity, Alert, ScrollView, KeyboardAvo
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { createTransaction } from '../../services/database/transactionDb';
-import { getCustomers, Customer } from '../../services/database/customerDb';
+import { searchCustomers, Customer } from '../../services/database/customerDb';
 import { useTransactionStore } from '../../store/transactionStore';
 import { rupeesToPaisa } from '../../utils/calculations';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
@@ -28,17 +28,18 @@ export const AddTransactionScreen: React.FC<Props> = ({ navigation }) => {
   const [date, setDate] = useState(todayDate());
   const [loading, setLoading] = useState(false);
 
+  // The picker narrows via SQL as you type — at most 20 matches, never the whole
+  // customer list — so starting an entry costs the same at 40 customers or 4,000.
   useEffect(() => {
-    const fetchCustomers = async () => {
-      if (user?.id) {
-        const custs = await getCustomers(user.id);
-        setCustomers(custs);
-      }
-    };
-    fetchCustomers();
-  }, [user?.id]);
+    let active = true;
+    if (!user?.id) return;
+    searchCustomers(user.id, partyName, 20)
+      .then(page => { if (active) setCustomers(page.rows); })
+      .catch(e => { if (__DEV__) console.error('[AddTransaction] customer search failed:', e); });
+    return () => { active = false; };
+  }, [user?.id, partyName]);
 
-  const filteredCustomers = customers.filter(c => c.name.toLowerCase().includes(partyName.toLowerCase()));
+  const filteredCustomers = customers;
 
   const validate = (): number | null => {
     if (!partyName.trim()) {

@@ -1,5 +1,5 @@
 export interface ReportOptions {
-  reportType: 'cash' | 'stock' | 'bill' | 'staff' | 'expense';
+  reportType: 'cash' | 'stock' | 'stockIn' | 'stockOut' | 'bill' | 'staff' | 'expense';
   userId: string;
   /** YYYY-MM-DD, inclusive. Either end may be omitted for an open range (all dates). */
   startDate?: string;

@@ -1412,7 +1412,7 @@ check(79,'customer scoping is unchanged: each level sees exactly its branch, by 
  assert.deepEqual((await api.getCustomers('owner')).map(c=>c.id).sort(),['cust_owner','cust_staffA','cust_staffB','cust_subB']);
  // The SQL scope text is the byte-identical userScope shape.
  const src=read('src/services/database/customerDb.ts');const shape=/user_id = \? OR user_id IN \(SELECT id FROM users WHERE parentId = \?\) OR user_id IN \(SELECT id FROM users WHERE parentId IN \(SELECT id FROM users WHERE parentId = \?\)\)/g;
- assert.equal((src.match(shape)||[]).length,4,'every customer query uses the shared 3-level scope');assert.ok(!/is_deleted = 0[^)]*parentId/.test(src));
+ assert.equal((src.match(shape)||[]).length,5,'every customer query (incl. searchCustomers) uses the shared 3-level scope');assert.ok(!/is_deleted = 0[^)]*parentId/.test(src));
 }));
 check(80,'both customer forms carry the new fields, the Customer Book can edit, and the bill quick-add no longer crashes','customer screens',()=>{
  const add=read('src/screens/staff/AddCustomerModal.tsx'),book=read('src/screens/CustomerBook/CustomerBookScreen.tsx'),bill=read('src/screens/BillBook/CreateNewBillModal.tsx');
@@ -1459,6 +1459,717 @@ check(81,'a sub-staff cannot obtain, set or wipe a CNIC; owner and branch staff 
  // Screens: the field is offered only to those who may see it, and the detail row hides when null.
  for(const f of ['src/screens/staff/AddCustomerModal.tsx','src/screens/CustomerBook/CustomerBookScreen.tsx']){const s=read(f);assert.ok(/canViewCnic\(user\.id\)/.test(s),f);assert.ok(/showCnic &&/.test(s),f+' hides the CNIC field');assert.ok(/\.\.\.\(showCnic \? \{ cnic \} : \{\}\)/.test(s),f+' never sends the key when hidden');}
  assert.ok(/\{customer\.cnic && </.test(read('src/screens/staff/CustomerDetailScreen.tsx')),'detail row is conditional on the (possibly redacted) value');
+}));
+
+check(82,'Cash In/Out from a past day lands on THAT day: its Day Book, totals and drift move; today does not',at('src/screens/CashBook/CashEntryModal.tsx','viewedDay'),()=>isolated(async h=>{
+ seedPeople(h);h.login('staffA');
+ const api=cash(h),closing=closingDb(h);
+ const today=h.load('src/utils/dates.ts').todayDate();
+ const PAST='2026-09-10';assert.notEqual(PAST,today);
+ // The viewed day is closed first, so a late entry must register as drift ON THAT DAY.
+ await closing.closeDay(PAST);
+ const beforeToday=await api.getDayBook('staffA',today);
+ // What the modal does when opened from the Cash Book showing PAST: the date it was handed.
+ const entry=await api.createCashEntry('staffA','Forgotten sale',450000,'in',PAST,null,'Sales',null);
+ assert.equal(h.one('SELECT date FROM cashbook WHERE id=?',entry.id).date,PAST,'stored on the viewed day');
+ const past=await api.getDayBook('staffA',PAST);
+ assert.ok(past.entries.some(e=>e.id===entry.id),'appears in the viewed day\'s Day Book');
+ assert.equal(past.dayTotals.cashIn,450000);assert.equal(past.dayTotals.entryCount,1);assert.equal(past.dayTotals.net,450000);
+ const nowToday=await api.getDayBook('staffA',today);
+ assert.ok(!nowToday.entries.some(e=>e.id===entry.id),'absent from today');
+ assert.deepEqual(plain(nowToday.dayTotals),plain(beforeToday.dayTotals),'today\'s totals unchanged');
+ const pastStatus=await closing.getDayStatus('staffA',PAST);
+ assert.equal(pastStatus.drifted,true,'the closed viewed day shows drift');assert.equal(pastStatus.latest.cash_in_paisa,0);assert.equal(pastStatus.current.cashIn,450000);
+ assert.equal((await closing.getDayStatus('staffA',today)).drifted,false,'today is not affected');
+ // Cash OUT the same way.
+ const out=await api.createCashEntry('staffA','Forgotten purchase',120000,'out',PAST,null,'Purchases',null);
+ const past2=await api.getDayBook('staffA',PAST);
+ assert.equal(past2.dayTotals.cashOut,120000);assert.equal(past2.dayTotals.net,330000);assert.equal(past2.dayTotals.entryCount,2);
+ assert.ok(!(await api.getDayBook('staffA',today)).entries.some(e=>e.id===out.id));
+ // Wiring: the screen hands the viewed day to BOTH routes; the modal prefills from it and
+ // still falls back to today when nothing valid is passed; the field remains editable.
+ const screen=read('src/screens/CashBook/CashBookScreen.tsx'),modal=read('src/screens/CashBook/CashEntryModal.tsx');
+ assert.ok(/navigate\('CashOutModal', \{ mode: 'out', date: viewDate \}\)/.test(screen),'Cash Out passes viewDate');
+ assert.ok(/navigate\('CashInModal', \{ mode: 'in', date: viewDate \}\)/.test(screen),'Cash In passes viewDate');
+ assert.ok(/const viewedDay = route\?\.params\?\.date;/.test(modal));
+ assert.ok(/viewedDay && isValidDateValue\(viewedDay\) \? viewedDay : todayDate\(\)/.test(modal),'prefill with validated fallback');
+ assert.ok(/<DateField[\s\S]{0,200}value=\{date\}[\s\S]{0,120}setDate\(txt\)/.test(modal),'date field kept and editable');
+ assert.ok(!/generateCashbookPDF/.test(screen),'legacy JS-summing PDF must not be revived');
+ for(const nav of ['src/navigation/StaffNavigator.tsx','src/navigation/AdminNavigator.tsx']){
+  const n=read(nav);for(const r of ['CashInModal','CashOutModal'])assert.ok(new RegExp('name="'+r+'" component=\\{CashEntryModal\\}').test(n),nav+' '+r);
+ }
+}));
+
+check(83,'Cash Book PDF exports exactly the viewed day and reconciles with the Day Book; presets, empty day, scoping and money hold',at('src/components/Download/reportPeriod.ts','initialPeriod'),()=>isolated(async h=>{
+ seedPeriods(h);const fmt=calc(h).formatCurrency;const {presetPeriod}=periodApi(h);
+ const strong=(html,label)=>{const m=new RegExp(label+': <strong>([^<]+)</strong>').exec(html);assert.ok(m,label+' missing');return m[1];};
+ // 1. Every viewed day, for every level: the PDF rows are that day's Day Book rows and the
+ //    three totals are getDayBook's SQL aggregate — cash in, cash out AND net.
+ const failures=[];
+ for(const [who,scope] of [['owner',OWNER_TREE],['staffA',['staffA','subA']],['subA',['subA']],['staffB',['staffB','subB']],['otherOwner',['otherStaff']]]){
+  for(const [tag,day] of Object.entries(DAYS)){
+   const html=await exportFile(h,'cash',who,{startDate:day,endDate:day});
+   const book=await cash(h).getDayBook(who,day);
+   const expected=sorted(book.entries.map(e=>e.description)),got=tagsIn(html);
+   if(JSON.stringify(expected)!==JSON.stringify(got))failures.push(who+'/'+day+' rows: '+expected+' vs '+got);
+   if(strong(html,'Total IN')!==fmt(book.dayTotals.cashIn))failures.push(who+'/'+day+' in');
+   if(strong(html,'Total OUT')!==fmt(book.dayTotals.cashOut))failures.push(who+'/'+day+' out');
+   if(strong(html,'Net Balance')!==fmt(book.dayTotals.net))failures.push(who+'/'+day+' net');
+   if(book.entries.length===0&&!html.includes('No records for this period'))failures.push(who+'/'+day+' empty doc');
+   if(/Rs\.?\s+Rs\./.test(html))failures.push(who+'/'+day+' doubled prefix');
+   if(/>\d{6,}</.test(html))failures.push(who+'/'+day+' raw paisa');
+  }
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ // 2. A day with nothing on it anywhere produces the no-records document with zero totals.
+ const empty=await exportFile(h,'cash','owner',{startDate:'2026-07-04',endDate:'2026-07-04'});
+ assert.ok(empty.includes('No records for this period'));assert.equal(strong(empty,'Total IN'),fmt(0));assert.equal(strong(empty,'Net Balance'),fmt(0));
+ // 3. A deleted entry on the viewed day is neither listed nor counted — same rule as the screen.
+ h.sqlite.prepare("UPDATE cashbook SET isDeleted=1 WHERE id='cash_ROW_staffA_d0'").run();
+ const afterDelete=await exportFile(h,'cash','staffA',{startDate:DAYS.d0,endDate:DAYS.d0});
+ assert.ok(!afterDelete.includes('ROW_staffA_d0'));assert.equal(strong(afterDelete,'Total IN'),fmt((await cash(h).getDayBook('staffA',DAYS.d0)).dayTotals.cashIn));
+ // 4. Switching to a preset from the sheet exports that range, reconciling with Cash History.
+ for(const preset of ['today','week','month']){
+  const period=presetPeriod(preset,NOW);const html=await exportFile(h,'cash','owner',period);
+  const hist=await cash(h).getFilteredCashHistory('owner',period);
+  assert.deepEqual(tagsIn(html),sorted(hist.entries.map(e=>e.description)),preset+' rows');
+  assert.equal(strong(html,'Net Balance'),fmt(hist.cashSummary.cashBalance),preset+' net');
+  assert.deepEqual(tagsIn(html),expectTags(OWNER_TREE,IN_PRESET[preset]).filter(t=>t!=='ROW_staffA_d0'),preset+' preset membership');
+ }
+ // 5. The sheet's starting period: the viewed day itself; today → the Today pill; nothing → month.
+ const {initialPeriod}=periodApi(h);
+ const today=h.load('src/utils/dates.ts').todayDate();
+ assert.deepEqual(plain(initialPeriod('2026-09-10')),{preset:'custom',range:{startDate:'2026-09-10',endDate:'2026-09-10'}});
+ assert.deepEqual(plain(initialPeriod(today)),{preset:'today',range:{startDate:today,endDate:today}});
+ assert.equal(initialPeriod(undefined).preset,'month');assert.equal(initialPeriod('2026-99-99').preset,'month','invalid day falls back');
+ // 6. Wiring: Bill Book's exact button, opening the sheet with the viewed day; no legacy generator; route in both stacks.
+ const screen=read('src/screens/CashBook/CashBookScreen.tsx'),bill=read('src/screens/BillBook/BillBookScreen.tsx');
+ assert.ok(screen.includes("navigation.navigate('DownloadOptionsModal', { reportType: 'cash', date: viewDate })"),'button passes the viewed day');
+ const btn=/<TouchableOpacity[ ]*\n\s*style=\{\{ padding: 6 \}\}[ ]*\n\s*onPress=\{[^\n]*\}\n\s*>\n\s*<Text style=\{\{ fontSize: 14, fontWeight: '800', color: '#1dd1a1' \}\}>⬇ PDF Report<\/Text>/;
+ assert.ok(btn.test(screen)&&btn.test(bill),'same button markup as the Bill Book');
+ assert.ok(!/generateCashbookPDF/.test(screen));
+ for(const nav of ['src/navigation/StaffNavigator.tsx','src/navigation/AdminNavigator.tsx']){
+  const n=read(nav);const stack=n.slice(n.indexOf('name="CashBook"'),n.indexOf('</Stack.Navigator>',n.indexOf('name="CashBook"')));
+  assert.ok(stack.includes('name="DownloadOptionsModal"'),nav+': modal must sit in the Cash Book\'s own stack');
+ }
+}));
+
+check(84,'Stock IN/OUT report exports cover exactly the screen\'s range and direction, totals match the screen, print and export share one path',at('src/services/database/stockDb.ts','getStockMovementReport'),()=>isolated(async h=>{
+ seedPeriods(h);const fmt=calc(h).formatCurrency;const stock=h.load('src/services/database/stockDb.ts');
+ // A parent-owned item moved by a sub-staff, a deleted movement, and a movement on a deleted item.
+ h.insert('stock_items',{id:'item_cross',user_id:'staffA',name_en:'ROW_cross_d0',purchase_price:1,sale_price:1,quantity:5});
+ h.insert('stock_movements',{id:'mv_cross',user_id:'subA',item_id:'item_cross',change:3,cost_per_unit:12345,sale_price_unit:null,date:DAYS.d0});
+ h.insert('stock_movements',{id:'mv_gone',user_id:'staffA',item_id:'item_cross',change:9,cost_per_unit:99999,date:DAYS.d0,is_deleted:1});
+ h.insert('stock_items',{id:'item_dead',user_id:'staffA',name_en:'ROW_dead_d0',purchase_price:1,sale_price:1,quantity:5,is_deleted:1});
+ h.insert('stock_movements',{id:'mv_dead',user_id:'staffA',item_id:'item_dead',change:-4,sale_price_unit:77777,date:DAYS.d0});
+ // What the screens compute from their loaded rows (unpaginated JS reduce) — the PDF must equal it.
+ const screenTotals=(rows,dir)=>({entries:rows.length,qty:rows.reduce((s,r)=>s+Math.abs(r.change),0),
+  amount:rows.reduce((s,r)=>s+Math.abs(r.change)*(dir==='in'?(r.cost_per_unit||0):(r.sale_price_unit||r.cost_per_unit||0)),0)});
+ const strong=(html,label)=>{const m=new RegExp(label+': <strong>([^<]+)</strong>').exec(html);assert.ok(m,label+' missing');return m[1];};
+ const ranges=[{startDate:DAYS.d0,endDate:DAYS.d0},{startDate:DAYS.d3,endDate:DAYS.d4},{startDate:DAYS.d1},{endDate:DAYS.d2},{}];
+ const failures=[];
+ for(const who of ['owner','staffA','subA','staffB','otherOwner'])for(const dir of ['in','out'])for(const range of ranges){
+  const screenRows=await (dir==='in'?stock.getStockInReport:stock.getStockOutReport)(who,range.startDate,range.endDate);
+  const {rows,summary}=await stock.getStockMovementReport(who,dir,range.startDate,range.endDate);
+  const expected=screenTotals(screenRows,dir);
+  if(JSON.stringify(plain(rows))!==JSON.stringify(plain(screenRows)))failures.push(who+'/'+dir+' rows differ from the screen query');
+  if(JSON.stringify(plain(summary))!==JSON.stringify(expected))failures.push(who+'/'+dir+'/'+JSON.stringify(range)+' SQL summary '+JSON.stringify(summary)+' vs screen '+JSON.stringify(expected));
+  for(const r of rows){if(dir==='in'&&r.change<=0)failures.push('IN report has a non-positive movement');if(dir==='out'&&r.change>=0)failures.push('OUT report has a non-negative movement');}
+  const type=dir==='in'?'stockIn':'stockOut';const html=await exportFile(h,type,who,range);
+  const tags=sorted(new Set(html.match(/ROW_[A-Za-z]+_d\d/g)||[]));
+  if(JSON.stringify(tags)!==JSON.stringify(sorted(new Set(rows.map(r=>r.item_name_en)))))failures.push(who+'/'+type+' PDF rows: '+tags);
+  if(!html.includes('Stock '+dir.toUpperCase()+' Report'))failures.push(type+' not labelled as '+dir);
+  if(html.includes('Stock '+(dir==='in'?'OUT':'IN')+' Report'))failures.push(type+' labelled as the other direction');
+  if(strong(html,'Entries')!==String(expected.entries)||strong(html,'Total Qty '+dir.toUpperCase())!==String(expected.qty))failures.push(who+'/'+type+' counts');
+  if(strong(html,'Total Amount \\('+(dir==='in'?'purchase value':'sale value')+'\\)')!==fmt(expected.amount))failures.push(who+'/'+type+' amount');
+  if(rows.length===0&&!html.includes('No records for this period'))failures.push(who+'/'+type+' empty doc');
+  if(/Rs\.?\s+Rs\./.test(html))failures.push(type+' doubled prefix');if(/>\d{6,}</.test(html))failures.push(type+' raw paisa');
+  const csv=await exportFile(h,type,who,range,'csv');if(rows.length&&!/,\d+\.\d\d$/m.test(csv))failures.push(type+' CSV rupees');
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ // Scoping and exclusions on the specific fixtures.
+ const staffIn=(await stock.getStockMovementReport('staffA','in',DAYS.d0,DAYS.d0)).rows.map(r=>r.id);
+ assert.ok(staffIn.includes('mv_cross'),'sub-staff movement on the parent\'s item counts for the parent');
+ assert.ok(!staffIn.includes('mv_gone'),'deleted movement excluded');
+ assert.ok(!(await stock.getStockMovementReport('staffA','out',DAYS.d0,DAYS.d0)).rows.some(r=>r.id==='mv_dead'),'movement on a deleted item excluded');
+ assert.ok(!(await stock.getStockMovementReport('staffB','in',DAYS.d0,DAYS.d0)).rows.some(r=>r.id==='mv_cross'),'other branch cannot see it');
+ await assert.rejects(()=>stock.getStockMovementReport('owner','in','2026-09-30','2026-09-01'),/From date/);
+ await assert.rejects(()=>stock.getStockMovementReport('owner','in','nope'),/Invalid date/);
+ // The sheet opens on the range the screen was showing, open ends included.
+ const {initialPeriod}=periodApi(h);
+ assert.deepEqual(plain(initialPeriod(undefined,{startDate:'2026-09-01',endDate:'2026-09-30'})),{preset:'custom',range:{startDate:'2026-09-01',endDate:'2026-09-30'}});
+ assert.deepEqual(plain(initialPeriod(undefined,{startDate:'2026-09-05'})),{preset:'custom',range:{startDate:'2026-09-05'}});
+ assert.equal(initialPeriod(undefined,{}).preset,'month','"All Time" on the screen leaves the default');
+ // Wiring: no dead buttons, both screens export their own range and print through the same generator.
+ for(const [f,type] of [['src/screens/StockBook/StockInReportScreen.tsx','stockIn'],['src/screens/StockBook/StockOutReportScreen.tsx','stockOut']]){
+  const src=read(f);
+  assert.ok(!/coming soon/i.test(src),f+' still has a coming-soon button');
+  assert.ok(src.includes("navigation.navigate('DownloadOptionsModal', { reportType: '"+type+"', period: shownPeriod() })"),f+' export');
+  assert.ok(src.includes("generateFile({ reportType: '"+type+"', userId: user.id, ...shownPeriod(), format: 'pdf' })")&&src.includes('Print.printAsync({ uri })'),f+' print');
+  assert.ok(/onPress=\{handleExport\}/.test(src)&&/onPress=\{handlePrint\}/.test(src),f+' buttons wired');
+ }
+ for(const nav of ['src/navigation/StaffNavigator.tsx','src/navigation/AdminNavigator.tsx']){
+  const n=read(nav);const i=n.indexOf('name="StockInReportScreen"');const stack=n.slice(n.lastIndexOf('<Stack.Navigator',i),n.indexOf('</Stack.Navigator>',i));
+  assert.ok(stack.includes('name="StockOutReportScreen"')&&stack.includes('name="DownloadOptionsModal"'),nav+': modal must sit in the report screens\' stack');
+ }
+ // The top-level Stock Book button is untouched and its month preset is the whole calendar month.
+ assert.ok(read('src/screens/StockBook/StockBookScreen.tsx').includes("navigation.navigate('DownloadOptionsModal', { reportType: 'stock' })"));
+ assert.deepEqual(plain(periodApi(h).presetPeriod('month',NOW)),{startDate:'2026-09-01',endDate:'2026-09-30'});
+}));
+
+// ── List scaling, stage 1: Cash History keyset paging + day subtotals ─────────
+function seedBigCash(h){
+ seedPeople(h);const rows=[];let n=0;
+ // ~4,200 rows over 120 days across the owner tree (+ another business), with shared
+ // (date, createdAt) pairs so the id tiebreak matters, and a sprinkling of deleted rows.
+ for(const who of ['owner','staffA','subA','staffB','subB','otherStaff'])for(let d=0;d<120;d++){
+  const day=new Date(2026,8,30-d,12),date=localDay(day);
+  const perDay=who==='owner'?9:who==='otherStaff'?3:6;
+  for(let k=0;k<perDay;k++){
+   n++;const createdAt=date+'T'+String(8+(k%6)).padStart(2,'0')+':00:00.000Z';
+   const row={id:'big_'+String(n).padStart(5,'0'),userId:who,description:'D'+d+'K'+k+(k===2?' NEEDLE':''),amount_paisa:1000+n,direction:k%3?'in':'out',date,createdAt,isDeleted:n%17===0?1:0};
+   h.insert('cashbook',row);rows.push(row);
+  }
+ }
+ return rows;
+}
+const localDay=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+const keyOf=r=>[r.date,r.createdAt||'',r.id];
+const after=(a,b)=>{for(let i=0;i<3;i++){if(a[i]<b[i])return false;if(a[i]>b[i])return true;}return false;};
+async function pageAll(h,viewer,filter,limit=50,startCursor=null){
+ const pages=[];let cursor=startCursor;let guard=0;
+ do{const page=await cash(h).getFilteredCashHistory(viewer,filter,limit,0,cursor);pages.push(page);cursor=page.nextCursor;assert.ok(++guard<500,'runaway paging');}while(cursor);
+ return pages;
+}
+check(85,'Cash History: totals byte-identical at 1 vs N pages on 4,000+ rows; every row once; day subtotals are SQL; scoping/deletion on every page; insert and delete mid-scroll are safe',at('src/services/database/pagination.ts','keysetClause'),()=>isolated(async h=>{
+ const rows=seedBigCash(h);assert.ok(rows.length>4000,'fixture size '+rows.length);
+ const scopes={owner:['owner','staffA','subA','staffB','subB'],staffA:['staffA','subA'],subA:['subA']};
+ const filters=[{},{startDate:'2026-09-01',endDate:'2026-09-30'},{direction:'out'},{search:'needle'},{startDate:'2026-08-01',endDate:'2026-08-31',direction:'in'}];
+ const failures=[];
+ for(const [viewer,scope] of Object.entries(scopes))for(const filter of filters){
+  const inRange=r=>(!filter.startDate||r.date>=filter.startDate)&&(!filter.endDate||r.date<=filter.endDate);
+  const expected=rows.filter(r=>scope.includes(r.userId)&&!r.isDeleted&&inRange(r)&&(!filter.direction||filter.direction==='all'||r.direction===filter.direction)&&(!filter.search||r.description.toLowerCase().includes(filter.search)));
+  const expectedIds=new Set(expected.map(r=>r.id));
+  const uncapped=await cash(h).getFilteredCashHistory(viewer,filter);
+  assert.equal(uncapped.nextCursor,null,'uncapped query has no cursor');
+  const pages=await pageAll(h,viewer,filter);
+  const label=viewer+' '+JSON.stringify(filter)+' ('+expected.length+' rows, '+pages.length+' pages)';
+  // 1. Totals: identical on every page, identical to the uncapped query, identical to the fixture.
+  const t0=JSON.stringify(plain(pages[0].cashSummary));
+  for(const pg of pages)if(JSON.stringify(plain(pg.cashSummary))!==t0)failures.push(label+': summary changed between pages');
+  if(t0!==JSON.stringify(plain(uncapped.cashSummary)))failures.push(label+': paged summary differs from uncapped');
+  const fixIn=expected.filter(r=>r.direction==='in').reduce((a,r)=>a+r.amount_paisa,0),fixOut=expected.filter(r=>r.direction==='out').reduce((a,r)=>a+r.amount_paisa,0);
+  if(t0!==JSON.stringify({cashIn:fixIn,cashOut:fixOut,cashBalance:fixIn-fixOut}))failures.push(label+': summary '+t0+' vs fixture in='+fixIn+' out='+fixOut);
+  // 2. Every row exactly once, strictly descending across page boundaries, last row reached.
+  const seen=[];for(const pg of pages)for(const e of pg.entries)seen.push(e);
+  const ids=seen.map(e=>e.id);
+  if(new Set(ids).size!==ids.length)failures.push(label+': duplicate rows across pages');
+  if(ids.length!==expected.length)failures.push(label+': paged '+ids.length+' rows, expected '+expected.length);
+  for(const id of ids)if(!expectedIds.has(id))failures.push(label+': out-of-scope or deleted row '+id+' on a page');
+  for(let i=1;i<seen.length;i++)if(!after(keyOf(seen[i-1]),keyOf(seen[i])))failures.push(label+': order broke at '+seen[i].id);
+  if(JSON.stringify(ids)!==JSON.stringify(uncapped.entries.map(e=>e.id)))failures.push(label+': paged sequence differs from the uncapped sequence');
+  for(const pg of pages.slice(0,-1))if(pg.entries.length!==50)failures.push(label+': a non-final page was short');
+  // 3. Day subtotals: one SQL query, equal to the fixture's per-day sums, one row per day present.
+  const days=await cash(h).getCashHistoryDayTotals(viewer,filter);
+  const byDay={};for(const r of expected){const d=byDay[r.date]||(byDay[r.date]={cashIn:0,cashOut:0,entryCount:0});d[r.direction==='in'?'cashIn':'cashOut']+=r.amount_paisa;d.entryCount++;}
+  if(days.length!==Object.keys(byDay).length)failures.push(label+': '+days.length+' day rows vs '+Object.keys(byDay).length+' days');
+  for(const d of days){const e=byDay[d.day];if(!e||e.cashIn!==d.cashIn||e.cashOut!==d.cashOut||e.entryCount!==d.entryCount)failures.push(label+': day '+d.day+' subtotal '+JSON.stringify(plain(d))+' vs '+JSON.stringify(e));}
+  for(let i=1;i<days.length;i++)if(days[i-1].day<=days[i].day)failures.push(label+': day totals not newest-first');
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ // 4. A day straddling a page boundary: its header figure comes from the day query, not the page.
+ const first=(await pageAll(h,'owner',{},50));const cut=first[0].entries.at(-1).date;
+ const straddles=first[0].entries.filter(e=>e.date===cut).length+first[1].entries.filter(e=>e.date===cut).length;
+ const dayRow=(await cash(h).getCashHistoryDayTotals('owner',{})).find(d=>d.day===cut);
+ assert.ok(first[1].entries.some(e=>e.date===cut),'fixture must straddle a boundary');
+ assert.equal(dayRow.entryCount,straddles,'the straddling day\'s subtotal counts rows on BOTH pages');
+ assert.ok(dayRow.entryCount>first[0].entries.filter(e=>e.date===cut).length,'…not just the ones loaded first');
+ // 5. Insert mid-scroll: two pages loaded, then a NEW newest row and a new row inside the
+ //    unloaded range appear. Keyset: the newest never leaks into later pages (no duplicate),
+ //    the older one appears exactly once, the sequence stays strictly descending.
+ const before=await pageAll(h,'owner',{});const allBefore=before.flatMap(p=>p.entries.map(e=>e.id));
+ const two=[];let cur=null;for(let i=0;i<2;i++){const pg=await cash(h).getFilteredCashHistory('owner',{},50,0,cur);two.push(pg);cur=pg.nextCursor;}
+ const loaded=two.flatMap(p=>p.entries);const lastLoaded=loaded.at(-1);
+ h.insert('cashbook',{id:'new_newest',userId:'staffA',description:'late',amount_paisa:5,direction:'in',date:'2026-09-30',createdAt:'2026-09-30T23:59:59.000Z',isDeleted:0});
+ const olderDate=localDay(new Date(2026,8,30-60));
+ h.insert('cashbook',{id:'new_older',userId:'subB',description:'backdated',amount_paisa:7,direction:'out',date:olderDate,createdAt:olderDate+'T00:00:01.000Z',isDeleted:0});
+ assert.ok(after(keyOf(lastLoaded),[olderDate,olderDate+'T00:00:01.000Z','new_older']),'backdated row must fall inside the unloaded range');
+ const rest=await pageAll(h,'owner',{},50,cur);const restIds=rest.flatMap(p=>p.entries.map(e=>e.id));
+ const seq=[...loaded,...rest.flatMap(p=>p.entries)];
+ assert.ok(!restIds.includes('new_newest'),'a row newer than the cursor never appears on a later page');
+ assert.equal(restIds.filter(id=>id==='new_older').length,1,'a row inserted inside the unloaded range appears exactly once');
+ assert.equal(new Set(seq.map(e=>e.id)).size,seq.length,'no duplicates after the insert');
+ for(let i=1;i<seq.length;i++)assert.ok(after(keyOf(seq[i-1]),keyOf(seq[i])),'order held after the insert');
+ assert.deepEqual(seq.map(e=>e.id).filter(id=>id!=='new_older'),allBefore,'every original row still exactly once');
+ // Totals on the continued pages already include BOTH inserts — the summary is never paged.
+ for(const pg of rest)assert.equal(pg.cashSummary.cashIn,before[0].cashSummary.cashIn+5);
+ // A fresh load from the top shows both.
+ const reload=await pageAll(h,'owner',{});const reIds=reload.flatMap(p=>p.entries.map(e=>e.id));
+ assert.equal(reIds[0],'new_newest');assert.ok(reIds.includes('new_older'));assert.equal(reIds.length,allBefore.length+2);
+ // 6. Delete mid-scroll: soft-deleting an already-loaded row does not skip anything on later pages.
+ const two2=[];cur=null;for(let i=0;i<2;i++){const pg=await cash(h).getFilteredCashHistory('owner',{},50,0,cur);two2.push(pg);cur=pg.nextCursor;}
+ const expectedRest=(await pageAll(h,'owner',{},50,cur)).flatMap(p=>p.entries.map(e=>e.id));
+ h.sqlite.prepare('UPDATE cashbook SET isDeleted=1 WHERE id=?').run(two2[0].entries[3].id);
+ const afterDelete=(await pageAll(h,'owner',{},50,cur)).flatMap(p=>p.entries.map(e=>e.id));
+ assert.deepEqual(afterDelete,expectedRest,'later pages unchanged by a deletion above the cursor');
+ // 7. Legacy limit/offset path still works and reports no cursor beyond the end.
+ const nowIds=(await pageAll(h,'owner',{})).flatMap(p=>p.entries.map(e=>e.id));
+ const off=await cash(h).getFilteredCashHistory('owner',{},50,50);assert.equal(off.entries.length,50);assert.deepEqual(off.entries.map(e=>e.id),nowIds.slice(50,100));
+ // 8. Source: cursor on the rows query only; aggregates keep the plain WHERE; the screen pages and groups.
+ const db=read('src/services/database/cashbookDb.ts');
+ assert.ok(/SELECT \* FROM cashbook WHERE \$\{rowsWhere\}/.test(db),'rows query uses the cursored WHERE');
+ const hist=db.slice(db.indexOf('export const getFilteredCashHistory'),db.indexOf('export const createCashEntry'));
+ assert.equal((hist.match(/FROM cashbook WHERE \$\{where\}/g)||[]).length,2,'summary and day-totals use the un-cursored WHERE');
+ assert.equal((hist.match(/rowsWhere/g)||[]).length,2,'only the rows query is cursored');
+ assert.ok(/GROUP BY date\(date\)/.test(db));assert.ok(!/keysetClause\([^)]*\)[^\n]*SUM/.test(db));
+ const screen=read('src/screens/CashBook/CashHistory.tsx');
+ assert.ok(/<SectionList[\s\S]*stickySectionHeadersEnabled[\s\S]*onEndReached=\{loadMore\}/.test(screen),'SectionList with sticky headers and load-more');
+ assert.ok(!/<FlatList/.test(screen));assert.ok(/useState<DateRange>\(\(\) => thisMonthRange\(\)\)/.test(screen),'opens on this month');
+ assert.ok(/getCashHistoryDayTotals\(user\.id, activeFilter\)/.test(screen)&&!/getCashHistoryDayTotals[^\n]*cursor/.test(screen),'day totals fetched per filter, never per page');
+ assert.ok(/getFilteredCashHistory\(user\.id, activeFilter, PAGE_SIZE, 0, cursor\)/.test(screen),'next page uses the cursor');
+ assert.ok(!/\.reduce\(/.test(screen),'no on-screen summing');
+ assert.ok(/<DateRangeFilter value=\{range\}/.test(screen),'range control stays visible');
+ assert.equal(h.load('src/services/database/pagination.ts').PAGE_SIZE,50);
+ assert.deepEqual(plain(h.load('src/utils/dates.ts').thisMonthRange(new Date(2026,8,15))),{startDate:'2026-09-01',endDate:'2026-09-30'});
+}));
+
+// ── List scaling, stage 2: Khata keyset paging + day subtotals ───────────────
+function seedBigKhata(h){
+ seedPeople(h);const rows=[];let n=0;const parties=['Ali Traders','Bilal Store','Chand Foods','Danish Mart'];
+ for(const who of ['owner','staffA','subA','staffB','subB','otherStaff'])for(let d=0;d<120;d++){
+  const day=new Date(2026,8,30-d,12),date=localDay(day);
+  const perDay=who==='owner'?9:who==='otherStaff'?3:6;
+  for(let k=0;k<perDay;k++){
+   n++;const createdAt=date+'T'+String(8+(k%6)).padStart(2,'0')+':00:00.000Z';
+   const row={id:'kh_'+String(n).padStart(5,'0'),userId:who,partyName:parties[(d+k)%parties.length],amount_paisa:1000+n,type:k%3?'lena':'dena',notes:k===2?'needle note':'n',date,createdAt,isDeleted:n%17===0?1:0};
+   h.insert('transactions',row);rows.push(row);
+  }
+ }
+ return rows;
+}
+async function pageKhata(h,viewer,filter,limit=50,startCursor=null){
+ const pages=[];let cursor=startCursor;let guard=0;
+ do{const page=await khata(h).getFilteredKhata(viewer,filter,limit,0,cursor);pages.push(page);cursor=page.nextCursor;assert.ok(++guard<500,'runaway paging');}while(cursor);
+ return pages;
+}
+check(86,'Khata: totals byte-identical at 1 vs N pages on 4,000+ rows; every row once; day subtotals are SQL; pills zero out; ledger balances are all-time regardless of the range',at('src/services/database/transactionDb.ts','getKhataDayTotals'),()=>isolated(async h=>{
+ const rows=seedBigKhata(h);assert.ok(rows.length>4000);
+ const scopes={owner:['owner','staffA','subA','staffB','subB'],staffA:['staffA','subA'],subA:['subA']};
+ const filters=[{},{startDate:'2026-09-01',endDate:'2026-09-30'},{type:'lena'},{type:'dena',startDate:'2026-08-01',endDate:'2026-08-31'},{search:'bilal'},{search:'needle',type:'lena'}];
+ const failures=[];
+ for(const [viewer,scope] of Object.entries(scopes))for(const filter of filters){
+  const inRange=r=>(!filter.startDate||r.date>=filter.startDate)&&(!filter.endDate||r.date<=filter.endDate);
+  const expected=rows.filter(r=>scope.includes(r.userId)&&!r.isDeleted&&inRange(r)&&(!filter.type||filter.type==='all'||r.type===filter.type)&&(!filter.search||(r.partyName+' '+r.notes).toLowerCase().includes(filter.search)));
+  const expectedIds=new Set(expected.map(r=>r.id));
+  const uncapped=await khata(h).getFilteredKhata(viewer,filter);assert.equal(uncapped.nextCursor,null);
+  const pages=await pageKhata(h,viewer,filter);
+  const label=viewer+' '+JSON.stringify(filter)+' ('+expected.length+' rows, '+pages.length+' pages)';
+  const t0=JSON.stringify(plain(pages[0].balanceSummary));
+  for(const pg of pages)if(JSON.stringify(plain(pg.balanceSummary))!==t0)failures.push(label+': summary changed between pages');
+  if(t0!==JSON.stringify(plain(uncapped.balanceSummary)))failures.push(label+': paged summary differs from uncapped');
+  const lena=expected.filter(r=>r.type==='lena').reduce((a,r)=>a+r.amount_paisa,0),dena=expected.filter(r=>r.type==='dena').reduce((a,r)=>a+r.amount_paisa,0);
+  if(t0!==JSON.stringify({totalLena:lena,totalDena:dena,netBalance:lena-dena}))failures.push(label+': summary '+t0+' vs fixture');
+  // Type pills zero out under paging, on every page.
+  if(filter.type==='lena')for(const pg of pages)if(pg.balanceSummary.totalDena!==0)failures.push(label+': Dena must be 0 under the Lena pill');
+  if(filter.type==='dena')for(const pg of pages)if(pg.balanceSummary.totalLena!==0)failures.push(label+': Lena must be 0 under the Dena pill');
+  const seen=pages.flatMap(pg=>pg.transactions);const ids=seen.map(e=>e.id);
+  if(new Set(ids).size!==ids.length)failures.push(label+': duplicates');
+  if(ids.length!==expected.length)failures.push(label+': paged '+ids.length+' vs expected '+expected.length);
+  for(const id of ids)if(!expectedIds.has(id))failures.push(label+': out-of-scope/deleted/mistyped row '+id);
+  for(let i=1;i<seen.length;i++)if(!after(keyOf(seen[i-1]),keyOf(seen[i])))failures.push(label+': order broke at '+seen[i].id);
+  if(JSON.stringify(ids)!==JSON.stringify(uncapped.transactions.map(e=>e.id)))failures.push(label+': paged sequence differs from uncapped');
+  for(const pg of pages.slice(0,-1))if(pg.transactions.length!==50)failures.push(label+': short non-final page');
+  const days=await khata(h).getKhataDayTotals(viewer,filter);
+  const byDay={};for(const r of expected){const d=byDay[r.date]||(byDay[r.date]={lena:0,dena:0,entryCount:0});d[r.type]+=r.amount_paisa;d.entryCount++;}
+  if(days.length!==Object.keys(byDay).length)failures.push(label+': day rows '+days.length+' vs '+Object.keys(byDay).length);
+  for(const d of days){const e=byDay[d.day];if(!e||e.lena!==d.lena||e.dena!==d.dena||e.entryCount!==d.entryCount)failures.push(label+': day '+d.day+' '+JSON.stringify(plain(d))+' vs '+JSON.stringify(e));}
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ // Straddling day: header figure from the day query covers rows on both pages.
+ const first=await pageKhata(h,'owner',{});const cut=first[0].transactions.at(-1).date;
+ assert.ok(first[1].transactions.some(t=>t.date===cut),'fixture straddles a boundary');
+ const dayRow=(await khata(h).getKhataDayTotals('owner',{})).find(d=>d.day===cut);
+ assert.equal(dayRow.entryCount,first[0].transactions.filter(t=>t.date===cut).length+first[1].transactions.filter(t=>t.date===cut).length);
+ // Insert mid-scroll.
+ const before=await pageKhata(h,'owner',{});const allBefore=before.flatMap(p=>p.transactions.map(e=>e.id));
+ const two=[];let cur=null;for(let i=0;i<2;i++){const pg=await khata(h).getFilteredKhata('owner',{},50,0,cur);two.push(pg);cur=pg.nextCursor;}
+ const loaded=two.flatMap(p=>p.transactions);
+ h.insert('transactions',{id:'kh_newest',userId:'staffA',partyName:'Late Party',amount_paisa:5,type:'lena',date:'2026-09-30',createdAt:'2026-09-30T23:59:59.000Z',isDeleted:0});
+ const olderDate=localDay(new Date(2026,8,30-60));
+ h.insert('transactions',{id:'kh_older',userId:'subB',partyName:'Backdated',amount_paisa:7,type:'dena',date:olderDate,createdAt:olderDate+'T00:00:01.000Z',isDeleted:0});
+ assert.ok(after(keyOf(loaded.at(-1)),[olderDate,olderDate+'T00:00:01.000Z','kh_older']));
+ const rest=await pageKhata(h,'owner',{},50,cur);const restIds=rest.flatMap(p=>p.transactions.map(e=>e.id));
+ const seq=[...loaded,...rest.flatMap(p=>p.transactions)];
+ assert.ok(!restIds.includes('kh_newest'));assert.equal(restIds.filter(x=>x==='kh_older').length,1);
+ assert.equal(new Set(seq.map(e=>e.id)).size,seq.length);for(let i=1;i<seq.length;i++)assert.ok(after(keyOf(seq[i-1]),keyOf(seq[i])));
+ assert.deepEqual(seq.map(e=>e.id).filter(id=>id!=='kh_older'),allBefore);
+ for(const pg of rest){assert.equal(pg.balanceSummary.totalLena,before[0].balanceSummary.totalLena+5);assert.equal(pg.balanceSummary.totalDena,before[0].balanceSummary.totalDena+7);}
+ const reload=await pageKhata(h,'owner',{});const reIds=reload.flatMap(p=>p.transactions.map(e=>e.id));
+ assert.equal(reIds[0],'kh_newest');assert.ok(reIds.includes('kh_older'));assert.equal(reIds.length,allBefore.length+2);
+ // Delete mid-scroll.
+ const two2=[];cur=null;for(let i=0;i<2;i++){const pg=await khata(h).getFilteredKhata('owner',{},50,0,cur);two2.push(pg);cur=pg.nextCursor;}
+ const expectedRest=(await pageKhata(h,'owner',{},50,cur)).flatMap(p=>p.transactions.map(e=>e.id));
+ h.sqlite.prepare('UPDATE transactions SET isDeleted=1 WHERE id=?').run(two2[0].transactions[3].id);
+ assert.deepEqual((await pageKhata(h,'owner',{},50,cur)).flatMap(p=>p.transactions.map(e=>e.id)),expectedRest);
+ // Customer Ledger: per-party balances are ALL-TIME and identical whatever Khata's range is.
+ const ledger=await khata(h).getPartyBalances('owner');
+ const live=rows.filter(r=>['owner','staffA','subA','staffB','subB'].includes(r.userId)&&!r.isDeleted&&r.id!==two2[0].transactions[3].id);
+ for(const party of ['Ali Traders','Bilal Store','Chand Foods','Danish Mart']){
+  const mine=live.filter(r=>r.partyName===party);const l=mine.filter(r=>r.type==='lena').reduce((a,r)=>a+r.amount_paisa,0),d=mine.filter(r=>r.type==='dena').reduce((a,r)=>a+r.amount_paisa,0);
+  const row=ledger.find(x=>x.partyName===party);assert.ok(row,party);assert.equal(row.totalLena,l,party+' lena all-time');assert.equal(row.totalDena,d,party+' dena all-time');assert.equal(row.netBalance,l-d);
+ }
+ const monthOnly=await khata(h).getFilteredKhata('owner',{startDate:'2026-09-01',endDate:'2026-09-30'});
+ const ledgerSum=ledger.reduce((a,r)=>a+r.totalLena,0);assert.ok(ledgerSum>monthOnly.balanceSummary.totalLena,'ledger covers more than one month');
+ assert.ok(!/startDate|endDate|BETWEEN/.test(read('src/services/database/transactionDb.ts').split('export const getPartyBalances')[1].split('export const')[0]),'getPartyBalances takes no range');
+ // Source guards.
+ const db=read('src/services/database/transactionDb.ts');const sect=db.slice(db.indexOf('export const getFilteredKhata'),db.indexOf('export type { Transaction }'));
+ assert.equal((sect.match(/FROM transactions WHERE \$\{where\}/g)||[]).length,2,'summary and day-totals use the un-cursored WHERE');
+ assert.equal((sect.match(/rowsWhere/g)||[]).length,2,'only the rows query is cursored');assert.ok(/GROUP BY date\(date\)/.test(sect));
+ const screen=read('src/screens/staff/KhataScreen.tsx');
+ assert.ok(/<SectionList[\s\S]*stickySectionHeadersEnabled[\s\S]*onEndReached=\{loadMore\}/.test(screen));assert.ok(!/<FlatList/.test(screen));
+ assert.ok(/useState<DateRange>\(\(\) => thisMonthRange\(\)\)/.test(screen),'opens on this month');
+ assert.ok(/getKhataDayTotals\(user\.id, activeFilter\)/.test(screen)&&/getFilteredKhata\(user\.id, activeFilter, PAGE_SIZE, 0, cursor\)/.test(screen));
+ assert.ok(!/\.reduce\(/.test(screen),'no on-screen summing');
+ assert.ok(/navigation\.navigate\('CustomerLedger'\)/.test(screen),'Customer Ledger reachable from Khata');
+ assert.ok(/Totals for \{describeRange\(range\)\}/.test(screen)&&/All-time balance per customer/.test(screen),'range caption + ledger link');
+ assert.ok(/const \{ transactions: all \} = await getFilteredKhata\(user\.id, activeFilter\);/.test(screen),'PDF export covers the whole range, not the loaded page');
+ for(const nav of ['src/navigation/StaffNavigator.tsx','src/navigation/AdminNavigator.tsx']){const n=read(nav);const i=n.indexOf('name="KhataMain"');const stack=n.slice(n.lastIndexOf('<Stack.Navigator',i),n.indexOf('</Stack.Navigator>',i));assert.ok(stack.includes('name="CustomerLedger"'),nav);}
+}));
+
+// ── List scaling, batch A: Bill Book, Expense Book, Stock reports + item detail ──
+const TREE={owner:['owner','staffA','subA','staffB','subB'],staffA:['staffA','subA'],subA:['subA']};
+async function pageWith(fn,limit=50,startCursor=null){
+ const pages=[];let cursor=startCursor;let guard=0;
+ do{const page=await fn(limit,cursor);pages.push(page);cursor=page.nextCursor;assert.ok(++guard<500,'runaway paging');}while(cursor);
+ return pages;
+}
+// Generic keyset contract: totals byte-identical on every page and vs uncapped; every row
+// once, strictly descending, sequence == uncapped, full non-final pages; scope + deletion.
+function assertPaging(label,pages,uncapped,rowsOf,summaryOf,expectedIds,keyFn,failures){
+ const t0=JSON.stringify(plain(summaryOf(pages[0])));
+ for(const pg of pages)if(JSON.stringify(plain(summaryOf(pg)))!==t0)failures.push(label+': summary changed between pages');
+ if(t0!==JSON.stringify(plain(summaryOf(uncapped))))failures.push(label+': paged summary differs from uncapped');
+ const seen=pages.flatMap(rowsOf);const ids=seen.map(r=>r.id);
+ if(new Set(ids).size!==ids.length)failures.push(label+': duplicates');
+ if(ids.length!==expectedIds.size)failures.push(label+': paged '+ids.length+' vs expected '+expectedIds.size);
+ for(const id of ids)if(!expectedIds.has(id))failures.push(label+': unexpected row '+id);
+ for(let i=1;i<seen.length;i++)if(!after(keyFn(seen[i-1]),keyFn(seen[i])))failures.push(label+': order broke at '+seen[i].id);
+ if(JSON.stringify(ids)!==JSON.stringify(rowsOf(uncapped).map(r=>r.id)))failures.push(label+': paged sequence differs from uncapped');
+ for(const pg of pages.slice(0,-1))if(rowsOf(pg).length!==50)failures.push(label+': short non-final page');
+ return t0;
+}
+function seedBigBills(h){
+ seedPeople(h);const rows=[];let n=0;
+ for(const who of ['owner','staffA','subA','staffB','subB','otherStaff'])for(let d=0;d<120;d++){
+  const date=localDay(new Date(2026,8,30-d,12));const perDay=who==='owner'?9:who==='otherStaff'?3:6;
+  for(let k=0;k<perDay;k++){
+   n++;const created_at=date+'T'+String(8+(k%6)).padStart(2,'0')+':00:00.000Z';
+   const row={id:'bl_'+String(n).padStart(5,'0'),user_id:who,party_name:'Party '+(n%7),bill_no:n,total:100000+n,paid:n%4===0?100000+n:50000,due:n%4===0?0:50000+n,bill_date:date,created_at,is_deleted:n%17===0?1:0,is_draft:n%23===0?1:0,is_hold:n%29===0?1:0};
+   h.insert('bills',row);rows.push(row);
+   h.insert('bill_items',{id:'bi_'+n+'_a',bill_id:row.id,item_name:'A'+n,quantity:1,unit_price:1,line_total:1,is_deleted:0});
+   h.insert('bill_items',{id:'bi_'+n+'_b',bill_id:row.id,item_name:'B'+n,quantity:2,unit_price:1,line_total:2,is_deleted:0});
+   h.insert('bill_items',{id:'bi_'+n+'_x',bill_id:row.id,item_name:'X'+n,quantity:9,unit_price:1,line_total:9,is_deleted:1});
+  }
+ }
+ return rows;
+}
+check(87,'Bill Book: keyset paging with the bill_items N+1 folded into one query per page; totals byte-identical; day subtotals SQL; insert/delete mid-scroll',at('src/services/database/billDb.ts','getBillDayTotals'),()=>isolated(async h=>{
+ const rows=seedBigBills(h);assert.ok(rows.length>4000);const api=billDb(h);
+ const posted=r=>!r.is_draft&&!r.is_hold;
+ const filters=[{status:'posted'},{status:'posted',startDate:'2026-09-01',endDate:'2026-09-30'},{status:'all'},{status:'drafts'},{status:'posted',search:'party 3'}];
+ const failures=[];
+ for(const [viewer,scope] of Object.entries(TREE))for(const filter of filters){
+  const inRange=r=>(!filter.startDate||r.bill_date>=filter.startDate)&&(!filter.endDate||r.bill_date<=filter.endDate);
+  const okStatus=r=>filter.status==='all'||(filter.status==='drafts'?r.is_draft===1:filter.status==='holds'?r.is_hold===1:posted(r));
+  const expected=rows.filter(r=>scope.includes(r.user_id)&&!r.is_deleted&&inRange(r)&&okStatus(r)&&(!filter.search||r.party_name.toLowerCase().includes(filter.search)));
+  const expectedIds=new Set(expected.map(r=>r.id));
+  const uncapped=await api.getFilteredBills(viewer,filter);assert.equal(uncapped.nextCursor,null);
+  const pages=await pageWith((limit,cursor)=>api.getFilteredBills(viewer,filter,limit,0,cursor));
+  const label=viewer+' '+JSON.stringify(filter)+' ('+expected.length+' rows, '+pages.length+' pages)';
+  const t0=assertPaging(label,pages,uncapped,pg=>pg.bills,pg=>pg.billSummary,expectedIds,r=>[r.bill_date,r.created_at||'',r.id],failures);
+  const fix={billCount:expected.length,totalBilled:expected.reduce((a,r)=>a+r.total,0),totalPaid:expected.reduce((a,r)=>a+r.paid,0),totalDue:expected.reduce((a,r)=>a+r.due,0)};
+  if(t0!==JSON.stringify(fix))failures.push(label+': summary '+t0+' vs fixture '+JSON.stringify(fix));
+  // Items ride along on every page, live ones only, in ONE query per page.
+  for(const pg of pages)for(const b of pg.bills){if(!Array.isArray(b.items)||b.items.length!==2||b.items.some(i=>i.bill_id!==b.id||i.is_deleted))failures.push(label+': items wrong on '+b.id);}
+  const days=await api.getBillDayTotals(viewer,filter);
+  const byDay={};for(const r of expected){const d=byDay[r.bill_date]||(byDay[r.bill_date]={billCount:0,totalBilled:0,totalPaid:0,totalDue:0});d.billCount++;d.totalBilled+=r.total;d.totalPaid+=r.paid;d.totalDue+=r.due;}
+  if(days.length!==Object.keys(byDay).length)failures.push(label+': day rows');
+  for(const d of days){const e=byDay[d.day];if(!e||JSON.stringify(plain({billCount:d.billCount,totalBilled:d.totalBilled,totalPaid:d.totalPaid,totalDue:d.totalDue}))!==JSON.stringify(e))failures.push(label+': day '+d.day);}
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ // N+1 folded: a 50-bill page issues exactly one bill_items query.
+ const before=h.queries.length;const pg=await api.getFilteredBills('owner',{status:'posted'},50);assert.equal(pg.bills.length,50);
+ const itemQueries=h.queries.slice(before).filter(q=>/FROM bill_items/.test(q));
+ assert.equal(itemQueries.length,1,'one bill_items query per page, got '+itemQueries.length);assert.ok(/IN \(\?/.test(itemQueries[0]));
+ // Straddle, insert and delete mid-scroll.
+ const f={status:'posted'};const first=await pageWith((l,c)=>api.getFilteredBills('owner',f,l,0,c));const cut=first[0].bills.at(-1).bill_date;
+ assert.ok(first[1].bills.some(b=>b.bill_date===cut));
+ assert.equal((await api.getBillDayTotals('owner',f)).find(d=>d.day===cut).billCount,first[0].bills.filter(b=>b.bill_date===cut).length+first[1].bills.filter(b=>b.bill_date===cut).length);
+ const allBefore=first.flatMap(p=>p.bills.map(b=>b.id));
+ const two=[];let cur=null;for(let i=0;i<2;i++){const x=await api.getFilteredBills('owner',f,50,0,cur);two.push(x);cur=x.nextCursor;}
+ h.insert('bills',{id:'bl_newest',user_id:'staffA',party_name:'Late',bill_no:99999,total:5,paid:5,due:0,bill_date:'2026-09-30',created_at:'2026-09-30T23:59:59.000Z',is_deleted:0,is_draft:0,is_hold:0});
+ const olderDate=localDay(new Date(2026,8,30-60));
+ h.insert('bills',{id:'bl_older',user_id:'subB',party_name:'Backdated',bill_no:99998,total:7,paid:0,due:7,bill_date:olderDate,created_at:olderDate+'T00:00:01.000Z',is_deleted:0,is_draft:0,is_hold:0});
+ const rest=await pageWith((l,c)=>api.getFilteredBills('owner',f,l,0,c),50,cur);const restIds=rest.flatMap(p=>p.bills.map(b=>b.id));
+ const seq=[...two.flatMap(p=>p.bills),...rest.flatMap(p=>p.bills)];
+ assert.ok(!restIds.includes('bl_newest'));assert.equal(restIds.filter(x=>x==='bl_older').length,1);assert.equal(new Set(seq.map(b=>b.id)).size,seq.length);
+ assert.deepEqual(seq.map(b=>b.id).filter(id=>id!=='bl_older'),allBefore);
+ for(const x of rest)assert.equal(x.billSummary.totalBilled,first[0].billSummary.totalBilled+12,'continued pages already carry both inserts in the summary');
+ const two2=[];cur=null;for(let i=0;i<2;i++){const x=await api.getFilteredBills('owner',f,50,0,cur);two2.push(x);cur=x.nextCursor;}
+ const expectedRest=(await pageWith((l,c)=>api.getFilteredBills('owner',f,l,0,c),50,cur)).flatMap(p=>p.bills.map(b=>b.id));
+ h.sqlite.prepare('UPDATE bills SET is_deleted=1 WHERE id=?').run(two2[0].bills[3].id);
+ assert.deepEqual((await pageWith((l,c)=>api.getFilteredBills('owner',f,l,0,c),50,cur)).flatMap(p=>p.bills.map(b=>b.id)),expectedRest);
+ // Source: cursor on rows only; store pages; screen groups; default still this month.
+ const db=read('src/services/database/billDb.ts');const sect=db.slice(db.indexOf('export const getFilteredBills'),db.indexOf('export const billMatchesFilter'));
+ assert.equal((sect.match(/rowsWhere/g)||[]).length,2);assert.ok(/FROM bills WHERE \$\{where\}\`/.test(sect)&&/GROUP BY date\(bill_date\)/.test(sect));
+ assert.ok(!/for \(const b of bills\) \{[\s\S]*bill_items WHERE bill_id = \?/.test(db),'per-bill item query is gone');
+ const store=read('src/store/useBillStore.ts');assert.ok(/getFilteredBills\(userId, active, PAGE_SIZE\)/.test(store)&&/getFilteredBills\(userId, filter, PAGE_SIZE, 0, cursor\)/.test(store)&&/getBillDayTotals\(userId, active\)/.test(store));
+ assert.ok(/filter: \{ status: 'posted', \.\.\.thisMonth\(\) \}/.test(store),'default stays this month');
+ const screen=read('src/screens/BillBook/BillBookScreen.tsx');assert.ok(/<SectionList[\s\S]*stickySectionHeadersEnabled[\s\S]*onEndReached=\{loadMore\}/.test(screen)&&!/<FlatList/.test(screen)&&!/\.reduce\(/.test(screen));
+ assert.ok(/Billed<\/Text>[\s\S]*Paid<\/Text>/.test(screen),'day header shows Billed and Paid');
+}));
+function seedBigExpenses(h){
+ seedPeople(h);const rows=[];let n=0;const cats=['Rent','Fuel','Tea','Salary'];
+ for(const who of ['owner','staffA','subA','staffB','subB','otherStaff'])for(let d=0;d<120;d++){
+  const date=localDay(new Date(2026,8,30-d,12));const perDay=who==='owner'?9:who==='otherStaff'?3:6;
+  for(let k=0;k<perDay;k++){n++;const created_at=date+'T'+String(8+(k%6)).padStart(2,'0')+':00:00.000Z';
+   const row={id:'ex_'+String(n).padStart(5,'0'),user_id:who,description:'E'+n+(k===1?' needle':''),category:cats[k%4],amount:1000+n,expense_date:date,created_at,is_deleted:n%17===0?1:0};
+   h.insert('expenses',row);rows.push(row);}
+ }
+ return rows;
+}
+check(88,'Expense Book: keyset paging, totals byte-identical at 1 vs N pages, day subtotals SQL, default this month, insert/delete mid-scroll',at('src/services/database/expenseDb.ts','getExpenseDayTotals'),()=>isolated(async h=>{
+ const rows=seedBigExpenses(h);assert.ok(rows.length>4000);const api=h.load('src/services/database/expenseDb.ts');
+ const filters=[{},{startDate:'2026-09-01',endDate:'2026-09-30'},{category:'Fuel'},{search:'needle',startDate:'2026-08-01',endDate:'2026-08-31'}];
+ const failures=[];
+ for(const [viewer,scope] of Object.entries(TREE))for(const filter of filters){
+  const inRange=r=>(!filter.startDate||r.expense_date>=filter.startDate)&&(!filter.endDate||r.expense_date<=filter.endDate);
+  const expected=rows.filter(r=>scope.includes(r.user_id)&&!r.is_deleted&&inRange(r)&&(!filter.category||r.category===filter.category)&&(!filter.search||(r.description+' '+r.category).toLowerCase().includes(filter.search)));
+  const expectedIds=new Set(expected.map(r=>r.id));
+  const uncapped=await api.getFilteredExpenses(viewer,filter);assert.equal(uncapped.nextCursor,null);
+  const pages=await pageWith((l,c)=>api.getFilteredExpenses(viewer,filter,l,0,c));
+  const label=viewer+' '+JSON.stringify(filter)+' ('+expected.length+' rows, '+pages.length+' pages)';
+  const t0=assertPaging(label,pages,uncapped,pg=>pg.expenses,pg=>pg.expenseSummary,expectedIds,r=>[r.expense_date,r.created_at||'',r.id],failures);
+  if(t0!==JSON.stringify({totalExpense:expected.reduce((a,r)=>a+r.amount,0)}))failures.push(label+': summary vs fixture');
+  const days=await api.getExpenseDayTotals(viewer,filter);
+  const byDay={};for(const r of expected){const d=byDay[r.expense_date]||(byDay[r.expense_date]={totalExpense:0,entryCount:0});d.totalExpense+=r.amount;d.entryCount++;}
+  if(days.length!==Object.keys(byDay).length)failures.push(label+': day rows');
+  for(const d of days){const e=byDay[d.day];if(!e||e.totalExpense!==d.totalExpense||e.entryCount!==d.entryCount)failures.push(label+': day '+d.day);}
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ const f={};const first=await pageWith((l,c)=>api.getFilteredExpenses('owner',f,l,0,c));const cut=first[0].expenses.at(-1).expense_date;
+ assert.ok(first[1].expenses.some(e=>e.expense_date===cut));
+ assert.equal((await api.getExpenseDayTotals('owner',f)).find(d=>d.day===cut).entryCount,first[0].expenses.filter(e=>e.expense_date===cut).length+first[1].expenses.filter(e=>e.expense_date===cut).length);
+ const allBefore=first.flatMap(p=>p.expenses.map(e=>e.id));
+ let cur=null;const two=[];for(let i=0;i<2;i++){const x=await api.getFilteredExpenses('owner',f,50,0,cur);two.push(x);cur=x.nextCursor;}
+ h.insert('expenses',{id:'ex_newest',user_id:'staffA',description:'late',amount:5,expense_date:'2026-09-30',created_at:'2026-09-30T23:59:59.000Z',is_deleted:0});
+ const olderDate=localDay(new Date(2026,8,30-60));
+ h.insert('expenses',{id:'ex_older',user_id:'subB',description:'backdated',amount:7,expense_date:olderDate,created_at:olderDate+'T00:00:01.000Z',is_deleted:0});
+ const rest=await pageWith((l,c)=>api.getFilteredExpenses('owner',f,l,0,c),50,cur);const restIds=rest.flatMap(p=>p.expenses.map(e=>e.id));
+ const seq=[...two.flatMap(p=>p.expenses),...rest.flatMap(p=>p.expenses)];
+ assert.ok(!restIds.includes('ex_newest'));assert.equal(restIds.filter(x=>x==='ex_older').length,1);assert.equal(new Set(seq.map(e=>e.id)).size,seq.length);
+ assert.deepEqual(seq.map(e=>e.id).filter(id=>id!=='ex_older'),allBefore);
+ for(const x of rest)assert.equal(x.expenseSummary.totalExpense,first[0].expenseSummary.totalExpense+12);
+ const two2=[];cur=null;for(let i=0;i<2;i++){const x=await api.getFilteredExpenses('owner',f,50,0,cur);two2.push(x);cur=x.nextCursor;}
+ const expectedRest=(await pageWith((l,c)=>api.getFilteredExpenses('owner',f,l,0,c),50,cur)).flatMap(p=>p.expenses.map(e=>e.id));
+ h.sqlite.prepare('UPDATE expenses SET is_deleted=1 WHERE id=?').run(two2[0].expenses[3].id);
+ assert.deepEqual((await pageWith((l,c)=>api.getFilteredExpenses('owner',f,l,0,c),50,cur)).flatMap(p=>p.expenses.map(e=>e.id)),expectedRest);
+ const db=read('src/services/database/expenseDb.ts');const sect=db.slice(db.indexOf('export const getFilteredExpenses'),db.indexOf('export const addExpenseRecord'));
+ assert.equal((sect.match(/rowsWhere/g)||[]).length,2);assert.ok(/GROUP BY date\(expense_date\)/.test(sect));
+ const store=read('src/store/useExpenseStore.ts');assert.ok(/filter: \{ \.\.\.thisMonthRange\(\) \}/.test(store),'opens on this month');
+ assert.ok(/getFilteredExpenses\(userId, active, PAGE_SIZE\)/.test(store)&&/getFilteredExpenses\(userId, filter, PAGE_SIZE, 0, cursor\)/.test(store)&&/getExpenseDayTotals\(userId, active\)/.test(store));
+ const screen=read('src/screens/ExpenseBook/ExpenseBookScreen.tsx');assert.ok(/<SectionList[\s\S]*stickySectionHeadersEnabled[\s\S]*onEndReached=\{loadMore\}/.test(screen)&&!/<FlatList/.test(screen)&&!/\.reduce\(/.test(screen));
+ assert.ok(/<DateRangeFilter value=\{range\}/.test(screen),'range control stays visible');
+}));
+function seedBigMovements(h){
+ seedPeople(h);const rows=[];let n=0;
+ for(const who of ['owner','staffA','subA','staffB','subB','otherStaff']){
+  for(let i=0;i<3;i++)h.insert('stock_items',{id:'it_'+who+'_'+i,user_id:who,name_en:'ROW_'+who+'_item'+i,name_ur:'اردو'+i,purchase_price:1,sale_price:1,quantity:9});
+  for(let d=0;d<120;d++){const date=localDay(new Date(2026,8,30-d,12));const perDay=who==='owner'?9:who==='otherStaff'?3:6;
+   for(let k=0;k<perDay;k++){n++;const row={id:'mv_'+String(n).padStart(5,'0'),user_id:who,item_id:'it_'+who+'_'+(k%3),change:k%2?2+k:-(1+k),cost_per_unit:100+n,sale_price_unit:k%5?200+n:null,date,is_deleted:n%17===0?1:0};h.insert('stock_movements',row);rows.push(row);}}
+ }
+ return rows;
+}
+check(89,'Stock IN/OUT reports page with SQL header totals and day subtotals; item detail filters the month in SQL and pages',at('src/services/database/stockDb.ts','getStockMovementDayTotals'),()=>isolated(async h=>{
+ const rows=seedBigMovements(h);assert.ok(rows.length>4000);const api=h.load('src/services/database/stockDb.ts');
+ const rateOf=(r,dir)=>dir==='in'?(r.cost_per_unit||0):(r.sale_price_unit||r.cost_per_unit||0);
+ const filters=[{},{startDate:'2026-09-01',endDate:'2026-09-30'},{search:'item1'},{startDate:'2026-08-01',search:'ROW_staffA'}];
+ const failures=[];
+ for(const [viewer,scope] of Object.entries(TREE))for(const dir of ['in','out'])for(const filter of filters){
+  const inRange=r=>(!filter.startDate||r.date>=filter.startDate)&&(!filter.endDate||r.date<=filter.endDate);
+  const expected=rows.filter(r=>scope.includes(r.user_id)&&!r.is_deleted&&inRange(r)&&(dir==='in'?r.change>0:r.change<0)&&(!filter.search||('ROW_'+r.user_id+'_item'+r.item_id.slice(-1)).toLowerCase().includes(filter.search.toLowerCase())));
+  const expectedIds=new Set(expected.map(r=>r.id));
+  const call=(l,c)=>api.getStockMovementReport(viewer,dir,filter.startDate,filter.endDate,l,c,filter.search);
+  const uncapped=await call(-1,null);assert.equal(uncapped.nextCursor,null);
+  const pages=await pageWith(call);
+  const label=viewer+'/'+dir+' '+JSON.stringify(filter)+' ('+expected.length+' rows, '+pages.length+' pages)';
+  const t0=assertPaging(label,pages,uncapped,pg=>pg.rows,pg=>pg.summary,expectedIds,r=>[r.date,'',r.id],failures);
+  const fix={entries:expected.length,qty:expected.reduce((a,r)=>a+Math.abs(r.change),0),amount:expected.reduce((a,r)=>a+Math.abs(r.change)*rateOf(r,dir),0)};
+  if(t0!==JSON.stringify(fix))failures.push(label+': summary '+t0+' vs '+JSON.stringify(fix));
+  const days=await api.getStockMovementDayTotals(viewer,dir,filter.startDate,filter.endDate,filter.search);
+  const byDay={};for(const r of expected){const d=byDay[r.date]||(byDay[r.date]={entries:0,qty:0,amount:0});d.entries++;d.qty+=Math.abs(r.change);d.amount+=Math.abs(r.change)*rateOf(r,dir);}
+  if(days.length!==Object.keys(byDay).length)failures.push(label+': day rows');
+  for(const d of days){const e=byDay[d.day];if(!e||e.entries!==d.entries||e.qty!==d.qty||e.amount!==d.amount)failures.push(label+': day '+d.day);}
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ // Insert/delete mid-scroll on the IN report (keyset on date, id — no created_at).
+ const call=(l,c)=>api.getStockMovementReport('owner','in',undefined,undefined,l,c);
+ const first=await pageWith(call);const allBefore=first.flatMap(p=>p.rows.map(r=>r.id));
+ let cur=null;const two=[];for(let i=0;i<2;i++){const x=await call(50,cur);two.push(x);cur=x.nextCursor;}
+ h.insert('stock_movements',{id:'mv_newest',user_id:'staffA',item_id:'it_staffA_0',change:3,cost_per_unit:5,date:'2026-09-30',is_deleted:0});
+ const olderDate=localDay(new Date(2026,8,30-60));
+ h.insert('stock_movements',{id:'mv_older',user_id:'subB',item_id:'it_subB_0',change:4,cost_per_unit:7,date:olderDate,is_deleted:0});
+ const rest=await pageWith(call,50,cur);const restIds=rest.flatMap(p=>p.rows.map(r=>r.id));
+ const seq=[...two.flatMap(p=>p.rows),...rest.flatMap(p=>p.rows)];
+ assert.ok(!restIds.includes('mv_newest'));assert.equal(restIds.filter(x=>x==='mv_older').length,1);assert.equal(new Set(seq.map(r=>r.id)).size,seq.length);
+ assert.deepEqual(seq.map(r=>r.id).filter(id=>id!=='mv_older'),allBefore);
+ for(const x of rest)assert.equal(x.summary.amount,first[0].summary.amount+3*5+4*7);
+ const two2=[];cur=null;for(let i=0;i<2;i++){const x=await call(50,cur);two2.push(x);cur=x.nextCursor;}
+ const expectedRest=(await pageWith(call,50,cur)).flatMap(p=>p.rows.map(r=>r.id));
+ h.sqlite.prepare('UPDATE stock_movements SET is_deleted=1 WHERE id=?').run(two2[0].rows[3].id);
+ assert.deepEqual((await pageWith(call,50,cur)).flatMap(p=>p.rows.map(r=>r.id)),expectedRest);
+ // Item detail: month filtered in SQL, stats a SQL aggregate, paged, months from SQL.
+ const item='it_owner_0';const mine=rows.filter(r=>r.item_id===item&&!r.is_deleted&&r.id!==two2[0].rows[3].id);
+ const months=await api.getItemMovementMonths(item);assert.deepEqual(plain(months),sorted(new Set(mine.map(r=>r.date.slice(0,7)))));
+ for(const month of [...months,'ALL']){
+  const exp=mine.filter(r=>month==='ALL'||r.date.startsWith(month));
+  const pages=await pageWith((l,c)=>api.getItemMovements(item,month,l,c));const ids=pages.flatMap(p=>p.rows.map(r=>r.id));
+  assert.deepEqual(sorted(ids),sorted(exp.map(r=>r.id)),month+' rows');assert.equal(new Set(ids).size,ids.length);
+  const st=pages[0].summary;assert.deepEqual(plain(st),{totalIn:exp.filter(r=>r.change>0).reduce((a,r)=>a+r.change,0),totalOut:exp.filter(r=>r.change<0).reduce((a,r)=>a-r.change,0),count:exp.length},month+' stats');
+  for(const pg of pages)assert.deepEqual(plain(pg.summary),plain(st));
+  for(const pg of pages)for(const r of pg.rows)assert.ok(month==='ALL'||r.date.startsWith(month),'row outside the month');
+ }
+ await assert.rejects(()=>api.getItemMovements(item,'2026-9'),/Invalid month/);
+ // Source: screens/store wired to the paged, SQL-summarised path; no JS month filter or reduce.
+ for(const f of ['src/screens/StockBook/StockInReportScreen.tsx','src/screens/StockBook/StockOutReportScreen.tsx']){
+  const src=read(f);assert.ok(/<SectionList[\s\S]*stickySectionHeadersEnabled[\s\S]*onEndReached=\{loadMore\}/.test(src),f);assert.ok(!/<FlatList/.test(src)&&!/\.reduce\(/.test(src)&&!/\.filter\(item =>/.test(src),f+' no in-memory search/sum');
+  assert.ok(/fetchMovementReport\(user\.id, '(in|out)', \{ startDate: startStr, endDate: endStr, search: searchQuery \}\)/.test(src),f+' search in SQL');
+  assert.ok(/\{summary\.entries\}/.test(src)&&/const totalQty = summary\.qty;/.test(src),f+' header totals from SQL');
+ }
+ const det=read('src/screens/StockBook/StockItemDetailScreen.tsx');
+ assert.ok(!/getMovementsByItemId/.test(det)&&/getItemMovements\(item\.id, selectedMonth, PAGE_SIZE\)/.test(det)&&/getItemMovements\(item\.id, selectedMonth, PAGE_SIZE, cursor\)/.test(det));
+ assert.ok(!/movements\.filter\(m => m\.date && m\.date\.startsWith\(selectedMonth\)\)/.test(det),'JS month filter gone');assert.ok(!/filteredMovements\.forEach/.test(det),'JS stats gone');
+ assert.ok(/\[item\.id, selectedMonth\]\)/.test(det),'reloads on month change');assert.ok(/onEndReached=\{loadMore\}/.test(det));
+ const store=read('src/store/useStockStore.ts');assert.ok(/getStockMovementReport\(userId, direction, filter\.startDate, filter\.endDate, PAGE_SIZE, null, filter\.search\)/.test(store)&&/getStockMovementDayTotals\(userId, direction, filter\.startDate, filter\.endDate, filter\.search\)/.test(store));
+ const db=read('src/services/database/stockDb.ts');assert.ok(/GROUP BY date\(m\.date\)/.test(db)&&/strftime\('%Y-%m', date\) = \?/.test(db));
+}));
+
+// ── List scaling, batch B: Activity Log, Purchase Book, Customer Book + pickers ──
+check(90,'Activity Log: visibility OR is parenthesised, deleted rows excluded, a lone date bound works, keyset on (timestamp,id) reaches everything past the old LIMIT 100',at('src/services/database/activityDb.ts','ACTIVITY_KEYS'),()=>isolated(async h=>{
+ seedPeople(h);const api=h.load('src/services/database/activityDb.ts');const rows=[];let n=0;
+ // 6,000 activities over 150 days: written by staffA/subA (visible to owner via visible_to),
+ // by the owner, and by the other business (never visible); some deleted; shared timestamps.
+ for(let d=0;d<150;d++)for(let k=0;k<40;k++){n++;
+  const who=k%4===0?'owner':k%4===1?'staffA':k%4===2?'subA':'otherStaff';
+  const ts=new Date(Date.UTC(2026,8,30-d,8+(k%6),0,0)).toISOString();
+  const row={id:'act_'+String(n).padStart(5,'0'),user_id:who,user_name:who,action:k%3?'create':'delete',entity_type:k%5?'cash':'bill',description:'x'+n,visible_to:JSON.stringify(who==='owner'?['owner']:who==='otherStaff'?['otherOwner']:['staffA','owner']),timestamp:ts,is_deleted:n%19===0?1:0};
+  h.insert('activities',row);rows.push(row);}
+ const vis=rows.filter(r=>!r.is_deleted&&(r.user_id==='owner'||JSON.parse(r.visible_to).includes('owner')));
+ assert.ok(vis.length>3000);
+ // The precedence bug: with the old \`A OR B AND C\`, an entityType filter leaked every
+ // visible_to row regardless of entity. Now the filter narrows the whole visible set.
+ const bills=(await api.getActivities('owner',{entityType:'bill'},-1)).rows;
+ assert.equal(bills.length,vis.filter(r=>r.entity_type==='bill').length);assert.ok(bills.every(r=>r.entity_type==='bill'),'entity filter leaked');
+ const staffOnly=(await api.getActivities('owner',{staffId:'subA'},-1)).rows;
+ assert.ok(staffOnly.length>0&&staffOnly.every(r=>r.user_id==='subA'),'staff filter leaked');
+ assert.ok(!(await api.getActivities('owner',{},-1)).rows.some(r=>r.is_deleted||r.user_id==='otherStaff'),'deleted or foreign rows visible');
+ assert.ok(!(await api.getActivities('staffA',{},-1)).rows.some(r=>r.user_id==='owner'&&!JSON.parse(r.visible_to).includes('staffA')),'staff sees owner-only rows');
+ // A lone startDate (the dashboard's "last 7 days") now filters; it used to be ignored.
+ const since=(await api.getActivities('owner',{startDate:'2026-09-24'},-1)).rows;
+ assert.equal(since.length,vis.filter(r=>r.timestamp.slice(0,10)>='2026-09-24').length);assert.ok(since.every(r=>r.timestamp.slice(0,10)>='2026-09-24'));
+ const upto=(await api.getActivities('owner',{endDate:'2026-06-01'},-1)).rows;assert.ok(upto.length>0&&upto.every(r=>r.timestamp.slice(0,10)<='2026-06-01'));
+ assert.equal((await api.getActivities('owner',{startDate:'2026-09-24'},5)).rows.length,5,'dashboard asks for five');
+ await assert.rejects(()=>api.getActivities('owner',{startDate:'nope'}),/Invalid date/);
+ // Paging: every visible row exactly once, strictly descending, well past 100.
+ const pages=await pageWith((l,c)=>api.getActivities('owner',{},l,c));const ids=pages.flatMap(pg=>pg.rows.map(r=>r.id));
+ assert.equal(ids.length,vis.length,'old LIMIT 100 gone: '+ids.length);assert.equal(new Set(ids).size,ids.length);
+ const seen=pages.flatMap(pg=>pg.rows);for(let i=1;i<seen.length;i++)assert.ok(after([seen[i-1].timestamp,'',seen[i-1].id],[seen[i].timestamp,'',seen[i].id]),'order at '+seen[i].id);
+ assert.deepEqual(ids,(await api.getActivities('owner',{},-1)).rows.map(r=>r.id));
+ for(const pg of pages.slice(0,-1))assert.equal(pg.rows.length,50);
+ // Insert mid-scroll.
+ let cur=null;const two=[];for(let i=0;i<2;i++){const x=await api.getActivities('owner',{},50,cur);two.push(x);cur=x.nextCursor;}
+ h.insert('activities',{id:'act_newest',user_id:'staffA',user_name:'s',action:'create',entity_type:'cash',description:'late',visible_to:'["owner"]',timestamp:'2026-09-30T23:59:59.000Z',is_deleted:0});
+ h.insert('activities',{id:'act_older',user_id:'subA',user_name:'s',action:'create',entity_type:'cash',description:'back',visible_to:'["owner"]',timestamp:new Date(Date.UTC(2026,8,30-60,1,0,0)).toISOString(),is_deleted:0});
+ const rest=await pageWith((l,c)=>api.getActivities('owner',{},l,c),50,cur);const restIds=rest.flatMap(pg=>pg.rows.map(r=>r.id));
+ assert.ok(!restIds.includes('act_newest'));assert.equal(restIds.filter(x=>x==='act_older').length,1);
+ const seq=[...two.flatMap(pg=>pg.rows.map(r=>r.id)),...restIds];assert.equal(new Set(seq).size,seq.length);assert.deepEqual(seq.filter(x=>x!=='act_older'),ids);
+ // Source and store wiring.
+ const db=read('src/services/database/activityDb.ts');assert.ok(/\(json_extract\(visible_to, '\$'\) LIKE '%"' \|\| \? \|\| '"%' OR user_id = \?\) AND COALESCE\(is_deleted, 0\) = 0/.test(db),'parenthesised visibility');
+ assert.ok(!/LIMIT 100/.test(db));const st=read('src/store/useActivityStore.ts');assert.ok(/getActivities\(adminId, get\(\)\.filters, PAGE_SIZE, cursor\)/.test(st));
+ assert.ok(/getActivities\(userId, \{ startDate: [^}]+\}, 5\)/.test(read('src/store/useDashboardStore.ts')));
+ assert.ok(/onEndReached=\{\(\) => \{ if \(user\) loadMoreActivities\(user\.id\); \}\}/.test(read('src/screens/admin/ActivityLog.tsx')));
+}));
+check(91,'Purchase Book: range filter (this month) + keyset paging on orders and invoices; tab counts and day subtotals are SQL',at('src/services/database/purchaseDb.ts','getPurchaseOrderDayTotals'),()=>isolated(async h=>{
+ seedPeople(h);const api=h.load('src/services/database/purchaseDb.ts');const orders=[],invoices=[];let n=0;
+ h.insert('suppliers',{id:'sup1',user_id:'owner',name:'Supplier One'});
+ for(let d=0;d<200;d++){const date=localDay(new Date(2026,8,30-d,12));for(let k=0;k<12;k++){n++;const created_at=date+'T'+String(8+(k%5)).padStart(2,'0')+':00:00.000Z';
+  const o={id:'po_'+String(n).padStart(5,'0'),user_id:k%6===5?'otherOwner':'owner',supplier_id:'sup1',po_number:n,status:['draft','sent','received'][k%3],order_date:date,total:1000+n,received_total:k%3===2?1000+n:0,created_at,is_deleted:n%17===0?1:0};
+  h.insert('purchase_orders',o);orders.push(o);
+  const i={id:'pi_'+String(n).padStart(5,'0'),user_id:k%6===5?'otherOwner':'owner',supplier_id:'sup1',invoice_number:'INV'+n,invoice_date:date,subtotal:500+n,total:500+n,amount_paid:k%2?500+n:0,status:k%2?'paid':'unpaid',created_at,is_deleted:n%23===0?1:0};
+  h.insert('purchase_invoices',i);invoices.push(i);}}
+ assert.ok(orders.length>2000);const failures=[];
+ for(const filter of [{},{startDate:'2026-09-01',endDate:'2026-09-30'},{status:'received'},{startDate:'2026-05-01',endDate:'2026-06-30',status:'paid'}]){
+  const inR=(r,dk)=>(!filter.startDate||r[dk]>=filter.startDate)&&(!filter.endDate||r[dk]<=filter.endDate);
+  const eo=orders.filter(r=>r.user_id==='owner'&&!r.is_deleted&&inR(r,'order_date')&&(!filter.status||r.status===filter.status));
+  const ei=invoices.filter(r=>r.user_id==='owner'&&!r.is_deleted&&inR(r,'invoice_date')&&(!filter.status||r.status===filter.status));
+  for(const [name,exp,fn,dayFn,dk,settledKey] of [['orders',eo,(l,c)=>api.getFilteredPurchaseOrders('owner',filter,l,c),()=>api.getPurchaseOrderDayTotals('owner',filter),'order_date','received_total'],['invoices',ei,(l,c)=>api.getFilteredPurchaseInvoices('owner',filter,l,c),()=>api.getPurchaseInvoiceDayTotals('owner',filter),'invoice_date','amount_paid']]){
+   const uncapped=await fn(-1,null);const pages=await pageWith(fn);const label=name+' '+JSON.stringify(filter)+' ('+exp.length+')';
+   const t0=assertPaging(label,pages,uncapped,pg=>pg.rows,pg=>pg.summary,new Set(exp.map(r=>r.id)),r=>[r[dk],r.created_at||'',r.id],failures);
+   if(t0!==JSON.stringify({count:exp.length,total:exp.reduce((a,r)=>a+r.total,0),settled:exp.reduce((a,r)=>a+r[settledKey],0)}))failures.push(label+': summary '+t0);
+   const days=await dayFn();const byDay={};for(const r of exp){const dd=byDay[r[dk]]||(byDay[r[dk]]={count:0,total:0,settled:0});dd.count++;dd.total+=r.total;dd.settled+=r[settledKey];}
+   if(days.length!==Object.keys(byDay).length)failures.push(label+': day rows');
+   for(const d of days){const e=byDay[d.day];if(!e||e.count!==d.count||e.total!==d.total||e.settled!==d.settled)failures.push(label+': day '+d.day);}
+  }
+ }
+ assert.equal(failures.length,0,failures.join('\n'));
+ // Insert/delete mid-scroll on invoices.
+ const fn=(l,c)=>api.getFilteredPurchaseInvoices('owner',{},l,c);const first=await pageWith(fn);const allBefore=first.flatMap(p=>p.rows.map(r=>r.id));
+ let cur=null;const two=[];for(let i=0;i<2;i++){const x=await fn(50,cur);two.push(x);cur=x.nextCursor;}
+ h.insert('purchase_invoices',{id:'pi_newest',user_id:'owner',supplier_id:'sup1',invoice_number:'N',invoice_date:'2026-09-30',subtotal:5,total:5,amount_paid:0,status:'unpaid',created_at:'2026-09-30T23:59:59.000Z',is_deleted:0});
+ const olderDate=localDay(new Date(2026,8,30-60));
+ h.insert('purchase_invoices',{id:'pi_older',user_id:'owner',supplier_id:'sup1',invoice_number:'O',invoice_date:olderDate,subtotal:7,total:7,amount_paid:7,status:'paid',created_at:olderDate+'T00:00:01.000Z',is_deleted:0});
+ const rest=await pageWith(fn,50,cur);const restIds=rest.flatMap(p=>p.rows.map(r=>r.id));
+ assert.ok(!restIds.includes('pi_newest'));assert.equal(restIds.filter(x=>x==='pi_older').length,1);
+ const seq=[...two.flatMap(p=>p.rows.map(r=>r.id)),...restIds];assert.equal(new Set(seq).size,seq.length);assert.deepEqual(seq.filter(x=>x!=='pi_older'),allBefore);
+ for(const x of rest)assert.equal(x.summary.total,first[0].summary.total+12);
+ const two2=[];cur=null;for(let i=0;i<2;i++){const x=await fn(50,cur);two2.push(x);cur=x.nextCursor;}
+ const expectedRest=(await pageWith(fn,50,cur)).flatMap(p=>p.rows.map(r=>r.id));
+ h.sqlite.prepare('UPDATE purchase_invoices SET is_deleted=1 WHERE id=?').run(two2[0].rows[3].id);
+ assert.deepEqual((await pageWith(fn,50,cur)).flatMap(p=>p.rows.map(r=>r.id)),expectedRest);
+ await assert.rejects(()=>api.getFilteredPurchaseOrders('owner',{startDate:'2026-09-30',endDate:'2026-09-01'}),/From date/);
+ // Store default + screen wiring.
+ const st=read('src/store/usePurchaseStore.ts');assert.ok(/filter: \{ \.\.\.thisMonthRange\(\) \}/.test(st),'opens on this month');
+ assert.ok(/getFilteredPurchaseOrders\(userId, filter, PAGE_SIZE\)/.test(st)&&/getFilteredPurchaseInvoices\(userId, get\(\)\.filter, PAGE_SIZE, cur\.cursor\)/.test(st));
+ const sc=read('src/screens/PurchaseBook/PurchaseBookScreen.tsx');assert.ok(!/<FlatList/.test(sc));assert.equal((sc.match(/<SectionList/g)||[]).length,2);
+ assert.ok(/<DateRangeFilter value=\{range\}/.test(sc)&&/Orders \(\{orderList\.summary\.count\}\)/.test(sc)&&/Invoices \(\{invoiceList\.summary\.count\}\)/.test(sc));
+ assert.ok(/dayHeader\(orderList\.dayTotals, 'order', 'Received'\)/.test(sc)&&/dayHeader\(invoiceList\.dayTotals, 'invoice', 'Paid'\)/.test(sc));
+}));
+check(92,'Customer search is SQL, bounded and paged; both customer pickers stop loading the whole list',at('src/services/database/customerDb.ts','searchCustomers'),()=>isolated(async h=>{
+ seedPeople(h);const api=customerDb(h);const rows=[];
+ const names=['Ali','Bilal','Chand','Danish','Ehsan','Farhan','Ghulam','Hamza'];let n=0;
+ for(const who of ['owner','staffA','subA','staffB','subB','otherStaff'])for(let i=0;i<500;i++){n++;const row={id:'cu_'+String(n).padStart(5,'0'),user_id:who,name:names[i%8]+' '+String(i).padStart(3,'0'),phone:'03'+String(n).padStart(9,'0'),cnic:i%3?null:'34101-2345678-9',is_deleted:i%13===0?1:0};h.insert('customers',row);rows.push(row);}
+ assert.equal(rows.length,3000);
+ const cmp=(a,b)=>a.name.toLowerCase()<b.name.toLowerCase()?-1:a.name.toLowerCase()>b.name.toLowerCase()?1:a.id<b.id?-1:a.id>b.id?1:0;
+ for(const [viewer,scope] of Object.entries(TREE))for(const q of ['','ali','AN 00','0300000012','zzz']){
+  const exp=rows.filter(r=>scope.includes(r.user_id)&&!r.is_deleted&&(!q||r.name.toLowerCase().includes(q.toLowerCase())||r.phone.includes(q))).sort(cmp);
+  const pages=[];let cursor=null,guard=0;do{const pg=await api.searchCustomers(viewer,q,50,cursor);pages.push(pg);cursor=pg.nextCursor;assert.ok(++guard<200);}while(cursor);
+  const ids=pages.flatMap(p=>p.rows.map(r=>r.id));
+  assert.deepEqual(ids,exp.map(r=>r.id),viewer+' '+JSON.stringify(q));assert.equal(new Set(ids).size,ids.length);
+  for(const p of pages)assert.equal(p.total,exp.length,'count is the whole match');
+  for(const p of pages.slice(0,-1))assert.equal(p.rows.length,50);
+  if(viewer==='subA')for(const p of pages)assert.ok(p.rows.every(r=>r.cnic==null),'sub-staff never receives a CNIC through search');
+  if(viewer==='owner'&&!q)assert.ok(pages.some(p=>p.rows.some(r=>r.cnic)),'owner does');
+ }
+ // Bounded initial load: the pickers ask for a page, never everything.
+ const first=await api.searchCustomers('owner','',50);assert.equal(first.rows.length,50);assert.ok(first.total>2000);assert.ok(first.nextCursor);
+ const typed=await api.searchCustomers('owner','hamza 49',20);assert.ok(typed.rows.length>0&&typed.rows.length<=20&&typed.rows.every(r=>r.name.toLowerCase().includes('hamza 49')));
+ assert.equal((await api.searchCustomers('owner','%',50)).rows.length,0,'wildcards are literal');
+ // Source guards on the three call sites.
+ const book=read('src/screens/CustomerBook/CustomerBookScreen.tsx');assert.ok(!/getCustomers\(/.test(book)&&/searchCustomers\(user\.id, searchQuery, PAGE_SIZE\)/.test(book)&&/searchCustomers\(user\.id, searchQuery, PAGE_SIZE, cursor\)/.test(book));
+ assert.ok(!/customers\.filter\(c =>/.test(book)&&/Customer Book \(\{total\}\)/.test(book)&&/onEndReached=\{loadMore\}/.test(book));
+ const tx=read('src/screens/staff/AddTransactionScreen.tsx');assert.ok(!/getCustomers\(/.test(tx)&&/searchCustomers\(user\.id, partyName, 20\)/.test(tx)&&!/customers\.filter\(c =>/.test(tx));
+ const bill=read('src/screens/BillBook/CreateNewBillModal.tsx');assert.ok(!/getCustomers\(/.test(bill)&&/searchCustomers\(userId, '', 50\)/.test(bill)&&/searchCustomers\(user\.id, customerQuery, 50\)/.test(bill)&&/searchCustomers\(user\.id, customerQuery, 50, customerCursor\)/.test(bill));
+ assert.ok(/placeholder="Search customer by name or phone"/.test(bill)&&/onEndReached=\{loadMoreCustomers\}/.test(bill),'picker has a search box and load-more');
 }));
 
 (async()=>{

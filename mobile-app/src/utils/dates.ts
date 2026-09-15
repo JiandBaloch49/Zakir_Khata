@@ -18,6 +18,12 @@ export const localDate = (d: Date): string =>
 /** Today in the device's local timezone, as YYYY-MM-DD. */
 export const todayDate = (): string => localDate(new Date());
 
+/** First and last day of the LOCAL current month — the range the list screens open on. */
+export const thisMonthRange = (now: Date = new Date()): { startDate: string; endDate: string } => ({
+  startDate: localDate(new Date(now.getFullYear(), now.getMonth(), 1)),
+  endDate: localDate(new Date(now.getFullYear(), now.getMonth() + 1, 0)),
+});
+
 /**
  * Parses a stored value into a local Date, or null if it isn't a real date.
  * Accepts `YYYY-MM-DD` and legacy full ISO timestamps (rows written before the

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, FlatList, ScrollView,
+  View, Text, TouchableOpacity, StyleSheet, SectionList, ScrollView,
   Animated, ActivityIndicator, Dimensions, Alert, Keyboard, Platform
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -9,6 +9,7 @@ import { useBillStore } from '../../store/useBillStore';
 import { Bill } from '../../types/bill.types';
 import { formatCurrency } from '../../utils/calculations';
 import { DateRangeFilter, DateRange, describeRange } from '../../components/ui/DateRangeFilter';
+import { toDateValue, formatDisplayDate } from '../../utils/dates';
 import { themeColors } from '../../theme/theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
 
@@ -56,7 +57,7 @@ const BillItemView = React.memo(({ item, onPress }: { item: Bill, onPress: (item
 export const BillBookScreen = ({ navigation }: any) => {
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
-  const { bills, loading, summary, fetchBills, filter, setFilter } = useBillStore();
+  const { bills, loading, loadingMore, dayTotals, summary, fetchBills, loadMoreBills, filter, setFilter } = useBillStore();
 
   const filterTab = filter.status ?? 'posted';
   const range: DateRange = { startDate: filter.startDate, endDate: filter.endDate };
@@ -128,6 +129,45 @@ export const BillBookScreen = ({ navigation }: any) => {
     return <BillItemView item={item} onPress={handleBillPress} />;
   }, [handleBillPress]);
 
+  // Loaded bills grouped by bill day; a day straddling a page boundary keeps ONE
+  // section whose header shows the day's whole SQL subtotal.
+  const sections = React.useMemo(() => {
+    const byDay = new Map<string, Bill[]>();
+    for (const b of bills) {
+      const day = toDateValue(b.bill_date as string) || String(b.bill_date);
+      const list = byDay.get(day);
+      if (list) list.push(b); else byDay.set(day, [b]);
+    }
+    return [...byDay.entries()].map(([day, data]) => ({ day, data }));
+  }, [bills]);
+
+  // Day header: how many bills, what was billed and what was actually received that day.
+  const renderSectionHeader = React.useCallback(({ section }: { section: { day: string } }) => {
+    const t = dayTotals[section.day];
+    return (
+      <View style={styles.dayHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
+          {t && <Text style={styles.dayCount}>{t.billCount} {t.billCount === 1 ? 'bill' : 'bills'}</Text>}
+        </View>
+        {t && (
+          <View style={styles.dayRight}>
+            <View style={styles.dayCols}>
+              <Text style={[styles.dayColLabel, { color: themeColors.textSecondary }]}>Billed</Text>
+              <Text style={[styles.dayColLabel, { color: themeColors.success }]}>Paid</Text>
+            </View>
+            <View style={styles.dayCols}>
+              <Text style={[styles.dayColVal, { color: '#fff' }]}>{formatCurrency(t.totalBilled)}</Text>
+              <Text style={[styles.dayColVal, { color: themeColors.success }]}>{formatCurrency(t.totalPaid)}</Text>
+            </View>
+          </View>
+        )}
+      </View>
+    );
+  }, [dayTotals]);
+
+  const loadMore = React.useCallback(() => { if (user) loadMoreBills(user.id); }, [user, loadMoreBills]);
+
   return (
     <View style={[styles.container, { paddingBottom: insets.bottom }]}>
       
@@ -188,11 +228,17 @@ export const BillBookScreen = ({ navigation }: any) => {
           </View>
         </ScrollView>
       ) : (
-        <FlatList
-          data={filteredBills}
+        <SectionList
+          sections={sections}
           keyExtractor={item => item.id}
           renderItem={renderItem}
+          renderSectionHeader={renderSectionHeader}
+          stickySectionHeadersEnabled
           contentContainerStyle={{ padding: 12, paddingBottom: 140 }}
+          SectionSeparatorComponent={() => <View style={{ height: 8 }} />}
+          onEndReached={loadMore}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={ORANGE} /> : null}
           initialNumToRender={10}
           maxToRenderPerBatch={10}
           windowSize={5}
@@ -233,16 +279,29 @@ const styles = StyleSheet.create({
     borderRadius: 14, padding: 16, borderWidth: 1, borderColor: themeColors.border,
     shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, elevation: 3
   },
-  summaryTitle: { fontSize: 13, color: themeColors.textSecondary, fontWeight: '600' },
-  summaryAmount: { fontSize: 17, fontWeight: '800', color: '#fff' },
+  // Day header — the Cash Book day-header banner with Billed / Paid columns.
+  dayHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    backgroundColor: themeColors.cardBg, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
+    borderWidth: 1, borderColor: themeColors.border, marginBottom: 8,
+  },
+  dayTitle: { fontSize: 13, fontWeight: '800', color: '#fff', letterSpacing: 0.5 },
+  dayCount: { fontSize: 12, color: themeColors.textSecondary, marginTop: 2 },
+  dayRight: { alignItems: 'flex-end' },
+  dayCols: { flexDirection: 'row', gap: 16 },
+  dayColLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right', marginBottom: 2 },
+  dayColVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
+
+  summaryTitle: { fontSize: 13, color: themeColors.textSecondary, fontWeight: '600', flex: 1, marginRight: 12 },
+  summaryAmount: { fontSize: 17, fontWeight: '800', color: '#fff', flexShrink: 0, textAlign: 'right' },
 
   dateFilterContainer: {
-    flexDirection: 'row', backgroundColor: themeColors.cardBg, marginHorizontal: 12, marginTop: 12,
-    borderRadius: 14, padding: 12, alignItems: 'center', justifyContent: 'space-between',
+    backgroundColor: themeColors.cardBg, marginHorizontal: 12, marginTop: 12,
+    borderRadius: 14, paddingHorizontal: 12, paddingBottom: 12,
     borderWidth: 1, borderColor: themeColors.border,
     shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.2, elevation: 3
   },
-  dateBox: { flexDirection: 'row', alignItems: 'center', flex: 1 },
+  dateBox: { flexDirection: 'row', alignItems: 'center', minHeight: 36 },
   dateIcon: { fontSize: 20, color: themeColors.primaryTeal, marginRight: 8 },
   dateLabel: { fontSize: 11, color: themeColors.textSecondary },
   dateValue: { fontSize: 13, color: '#fff', fontWeight: '600' },

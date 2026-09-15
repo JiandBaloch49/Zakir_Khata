@@ -1,12 +1,14 @@
-import React, { useRef, useState, useCallback } from 'react';
+import React, { useRef, useState, useCallback, useMemo } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
-  View, Text, FlatList, TouchableOpacity, StyleSheet,
+  View, Text, SectionList, TouchableOpacity, StyleSheet,
   TextInput, ActivityIndicator, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
-import { getFilteredCashHistory, deleteCashEntry } from '../../services/database/cashbookDb';
+import { getFilteredCashHistory, getCashHistoryDayTotals, deleteCashEntry, CashDayTotal } from '../../services/database/cashbookDb';
+import { PAGE_SIZE, PageCursor } from '../../services/database/pagination';
+import { thisMonthRange, toDateValue, formatDisplayDate } from '../../utils/dates';
 import { DateRangeFilter, DateRange } from '../../components/ui/DateRangeFilter';
 import { useTransactionStore } from '../../store/transactionStore';
 import { formatCurrency, formatDate } from '../../utils/calculations';
@@ -43,29 +45,77 @@ export const CashHistory = ({ navigation }: any) => {
   const { user } = useAuthStore();
   const { loadCashBook } = useTransactionStore();
 
-  const [result, setResult] = useState<Awaited<ReturnType<typeof getFilteredCashHistory>> | null>(null);
-  const [range, setRange] = useState<DateRange>({});
+  // Rows are PAGED (keyset, PAGE_SIZE at a time); the summary and the per-day subtotals
+  // are SQL aggregates over the WHOLE filtered set, fetched once per filter change.
+  const [entries, setEntries] = useState<CashEntry[]>([]);
+  const [summary, setSummary] = useState<{ cashIn: number; cashOut: number; cashBalance: number } | null>(null);
+  const [dayTotals, setDayTotals] = useState<Map<string, CashDayTotal>>(new Map());
+  const [cursor, setCursor] = useState<PageCursor | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Opens on this month, like the Bill Book; the range control below widens it.
+  const [range, setRange] = useState<DateRange>(() => thisMonthRange());
   const [error, setError] = useState('');
   const request = useRef(0);
   const [filter, setFilter] = useState<FilterType>('all');
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
 
+  const activeFilter = useMemo(() => ({ ...range, direction: filter, search }), [range, filter, search]);
+
   const load = useCallback(async () => {
     const current = ++request.current;
     setLoading(true);
-    setResult(null);
+    setEntries([]);
+    setSummary(null);
+    setCursor(null);
     setError('');
     if (!user?.id) { setLoading(false); return; }
     try {
-      const data = await getFilteredCashHistory(user.id, { ...range, direction: filter, search });
-      if (current === request.current) setResult(data);
+      const [page, days] = await Promise.all([
+        getFilteredCashHistory(user.id, activeFilter, PAGE_SIZE),
+        getCashHistoryDayTotals(user.id, activeFilter),
+      ]);
+      if (current !== request.current) return;
+      setEntries(page.entries);
+      setSummary(page.cashSummary);
+      setCursor(page.nextCursor);
+      setDayTotals(new Map(days.map(d => [d.day, d])));
     } catch (err) {
       if (current === request.current) setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (current === request.current) setLoading(false);
     }
-  }, [user?.id, range, filter, search]);
+  }, [user?.id, activeFilter]);
+
+  // Next page: strictly after the last loaded row. Totals are NOT refetched here.
+  const loadMore = useCallback(async () => {
+    if (!user?.id || !cursor || loadingMore || loading) return;
+    const current = request.current;
+    setLoadingMore(true);
+    try {
+      const page = await getFilteredCashHistory(user.id, activeFilter, PAGE_SIZE, 0, cursor);
+      if (current !== request.current) return;
+      setEntries(prev => [...prev, ...page.entries]);
+      setCursor(page.nextCursor);
+    } catch (err) {
+      if (__DEV__) console.error('[CashHistory] load more failed:', err);
+    } finally {
+      if (current === request.current) setLoadingMore(false);
+    }
+  }, [user?.id, activeFilter, cursor, loadingMore, loading]);
+
+  // Group the loaded rows by calendar day. A day that straddles a page boundary keeps
+  // ONE section: the next page's rows append to it, and its header always shows the
+  // day's whole SQL subtotal, not a count of what happens to be loaded.
+  const sections = useMemo(() => {
+    const byDay = new Map<string, CashEntry[]>();
+    for (const e of entries) {
+      const day = toDateValue(e.date) || String(e.date);
+      const list = byDay.get(day);
+      if (list) list.push(e); else byDay.set(day, [e]);
+    }
+    return [...byDay.entries()].map(([day, data]) => ({ day, data }));
+  }, [entries]);
 
   useFocusEffect(useCallback(() => {
     void load();
@@ -90,12 +140,37 @@ export const CashHistory = ({ navigation }: any) => {
     ]);
   }, [user, loadCashBook, load]);
 
-  const filtered = result?.entries || [];
-  const { cashIn: totalIn, cashOut: totalOut, cashBalance: net } = result?.cashSummary || { cashIn: 0, cashOut: 0, cashBalance: 0 };
+  const result = summary;
+  const { cashIn: totalIn, cashOut: totalOut, cashBalance: net } = summary || { cashIn: 0, cashOut: 0, cashBalance: 0 };
 
   const renderItem = useCallback(({ item }: { item: CashEntry }) => {
     return <CashEntryRow item={item} onPress={() => navigation.navigate('CashEntryDetail', { entry: item })} handleDelete={handleDelete} />;
   }, [handleDelete, navigation]);
+
+  // Day header — the Cash Book's day-header banner, with that day's SQL subtotal.
+  const renderSectionHeader = useCallback(({ section }: { section: { day: string } }) => {
+    const t = dayTotals.get(section.day);
+    return (
+      <View style={styles.dateHeaderBanner}>
+        <View style={styles.dateHeaderLeft}>
+          <Text style={styles.dateTitle}>{formatDisplayDate(section.day)}</Text>
+          {t && <Text style={styles.entriesCountText}>{t.entryCount} {t.entryCount === 1 ? 'Entry' : 'Entries'}</Text>}
+        </View>
+        {t && (
+          <View style={styles.dateHeaderRight}>
+            <View style={styles.totalsHeaderRow}>
+              <Text style={[styles.columnLabel, { color: Colors.error }]}>Out</Text>
+              <Text style={[styles.columnLabel, { color: Colors.success }]}>In</Text>
+            </View>
+            <View style={styles.totalsValueRow}>
+              <Text style={[styles.columnVal, { color: Colors.error }]}>{formatCurrency(t.cashOut)}</Text>
+              <Text style={[styles.columnVal, { color: Colors.success }]}>{formatCurrency(t.cashIn)}</Text>
+            </View>
+          </View>
+        )}
+      </View>
+    );
+  }, [dayTotals]);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -175,19 +250,25 @@ export const CashHistory = ({ navigation }: any) => {
           <Text style={styles.emptyText}>{error}</Text>
           <TouchableOpacity onPress={load}><Text style={styles.filterTabText}>Retry</Text></TouchableOpacity>
         </View>
-      ) : filtered.length === 0 ? (
+      ) : entries.length === 0 ? (
         <View style={styles.center}>
           <Text style={styles.emptyText}>No transactions found</Text>
         </View>
       ) : (
-        <FlatList
-          data={filtered}
+        <SectionList
+          sections={sections}
           keyExtractor={item => item.id}
           renderItem={renderItem}
+          renderSectionHeader={renderSectionHeader}
+          stickySectionHeadersEnabled
           contentContainerStyle={{ padding: 16, paddingBottom: 135 }}
           ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
+          SectionSeparatorComponent={() => <View style={{ height: 8 }} />}
           onRefresh={load}
           refreshing={loading}
+          onEndReached={loadMore}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
           initialNumToRender={10}
           maxToRenderPerBatch={10}
           windowSize={5}
@@ -260,4 +341,19 @@ const styles = StyleSheet.create({
 
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   emptyText: { fontSize: 15, color: Colors.textGray },
+
+  // Day header — the same values as CashBookScreen's dateHeaderBanner block.
+  dateHeaderBanner: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    backgroundColor: Colors.bgCard, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
+    borderWidth: 1, borderColor: Colors.border,
+  },
+  dateHeaderLeft: { flex: 1 },
+  dateTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
+  entriesCountText: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
+  dateHeaderRight: { alignItems: 'flex-end' },
+  totalsHeaderRow: { flexDirection: 'row', gap: 16, marginBottom: 2 },
+  totalsValueRow: { flexDirection: 'row', gap: 16 },
+  columnLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right' },
+  columnVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
 });

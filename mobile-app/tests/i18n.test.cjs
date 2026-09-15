@@ -98,4 +98,57 @@ check('No forced RTL anywhere; translated shared components do not mix figures w
   }visit(sf);
  }
 });
+
+// ── Converted files must carry NO hardcoded user-facing text ─────────────────
+// Each rollout stage appends its screens here; the scan is AST-based so it cannot be
+// fooled by formatting. Flagged: JSX text with letters, string literals rendered
+// directly inside JSX braces or ternaries, user-facing string props, Alert.alert
+// string arguments and button labels. Allowed: emoji/punctuation-only text, format
+// names and file extensions, navigation route names and style tokens (never shown).
+const CONVERTED=[
+ 'src/components/TopHeaderWithBooks.tsx','src/components/OfflineBanner.tsx','src/components/SuccessModal.tsx',
+ 'src/components/CountryCodePicker.tsx','src/components/TranslateToUrdu.tsx','src/components/ui/CustomerAvatar.tsx',
+ 'src/components/ui/DateField.tsx','src/components/ui/DateRangeFilter.tsx','src/components/ui/EntryHistory.tsx',
+ 'src/components/reports/DateFilterPicker.tsx','src/components/Download/DownloadOptionsModal.tsx','src/navigation/AppNavigator.tsx',
+];
+const ALLOWED_LITERALS=new Set(['PDF','CSV','.pdf','.csv','application/pdf','text/csv','U','?','✓','✕','×','▼','📅','🔔','Rs.']);
+const USER_FACING_PROPS=new Set(['placeholder','title','message','accessibilityLabel','label','headerTitle','tabBarLabel','dialogTitle']);
+const hasWords=s=>/[A-Za-z]{2,}/.test(s.replace(/&[a-z]+;/g,''));
+function hardcodedStrings(file){
+ const text=fs.readFileSync(path.join(root,file),'utf8');
+ const sf=ts.createSourceFile(file,text,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
+ const hits=[];const flag=(node,value)=>{value=value.replace(/\s+/g,' ').trim();if(value&&hasWords(value)&&!ALLOWED_LITERALS.has(value))hits.push(value+' @'+(sf.getLineAndCharacterOfPosition(node.getStart(sf)).line+1));};
+ const insideT=n=>{for(let p=n.parent;p;p=p.parent)if(ts.isCallExpression(p)&&/^(t|.*\.t)$/.test(p.expression.getText(sf)))return true;return false;};
+ function visit(n){
+  if(ts.isJsxText(n))flag(n,n.getText(sf));
+  else if(ts.isJsxExpression(n)&&n.expression&&!ts.isJsxAttribute(n.parent)){
+   const e=n.expression;
+   if(ts.isStringLiteral(e)||ts.isNoSubstitutionTemplateLiteral(e))flag(e,e.text);
+   if(ts.isConditionalExpression(e))for(const b of [e.whenTrue,e.whenFalse])if(ts.isStringLiteral(b)||ts.isNoSubstitutionTemplateLiteral(b))flag(b,b.text);
+   if(ts.isTemplateExpression(e)&&!insideT(e)){flag(e,e.head.text);for(const sp of e.templateSpans)flag(sp,sp.literal.text);}
+  }
+  else if(ts.isJsxAttribute(n)&&USER_FACING_PROPS.has(n.name.getText(sf))&&n.initializer){
+   const i=n.initializer;
+   if(ts.isStringLiteral(i))flag(i,i.text);
+   else if(ts.isJsxExpression(i)&&i.expression&&(ts.isStringLiteral(i.expression)||ts.isNoSubstitutionTemplateLiteral(i.expression)))flag(i,i.expression.text);
+   else if(ts.isJsxExpression(i)&&i.expression&&ts.isTemplateExpression(i.expression)&&!insideT(i.expression))flag(i,i.expression.head.text);
+  }
+  else if(ts.isCallExpression(n)&&/Alert\.alert$/.test(n.expression.getText(sf))){
+   for(const a of n.arguments.slice(0,2))if(ts.isStringLiteral(a)||ts.isNoSubstitutionTemplateLiteral(a))flag(a,a.text);
+  }
+  else if(ts.isPropertyAssignment(n)&&/^(text|label|title|message)$/.test(n.name.getText(sf))&&(ts.isStringLiteral(n.initializer)||ts.isNoSubstitutionTemplateLiteral(n.initializer))&&!insideT(n))flag(n,n.initializer.text);
+  ts.forEachChild(n,visit);
+ }
+ visit(sf);return hits;
+}
+check('Converted screens and components contain no hardcoded user-facing strings',()=>{
+ const failures=[];
+ for(const f of CONVERTED){const hits=hardcodedStrings(f);if(hits.length)failures.push(f+'\n    '+hits.join('\n    '));}
+ assert.equal(failures.length,0,'Hardcoded strings remain:\n  '+failures.join('\n  '));
+ // The scanner itself must catch what it claims to: a fixture with every pattern.
+ const fixture=path.join(root,'tests','.i18n-fixture.tsx');
+ const BT=String.fromCharCode(96);
+ fs.writeFileSync(fixture,"const A=()=><T>Hello there<T placeholder=\"Type here\">{'Literal'}{ok?'Yes':'No'}{"+BT+"Photo of ${x}"+BT+"}</T>{Alert.alert('Oops','Failed')}{[{text:'Cancel'}]}</T>;");
+ try{const hits=hardcodedStrings(path.relative(root,fixture));assert.equal(hits.length,9,'scanner missed patterns: '+hits.join(' | '));}finally{fs.unlinkSync(fixture);}
+});
 (async()=>{let passed=0;for(const c of checks){try{await c.fn();passed++;console.info('PASS '+c.name);}catch(e){console.error('FAIL '+c.name+'\n'+e.stack);}}console.info(`TOTAL ${checks.length}: ${passed} PASS, ${checks.length-passed} FAIL`);process.exitCode=passed===checks.length?0:1;})();

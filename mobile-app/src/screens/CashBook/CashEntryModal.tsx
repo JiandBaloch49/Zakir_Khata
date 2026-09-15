@@ -15,7 +15,7 @@ import { getStockItemsByUserId } from '../../services/database/stockDb';
 import { Colors } from '../../theme';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
 import { DateField } from '../../components/ui/DateField';
-import { todayDate } from '../../utils/dates';
+import { todayDate, isValidDateValue } from '../../utils/dates';
 
 const GREEN = '#22C55E';
 const DARK_RED = '#8B0000';
@@ -27,7 +27,9 @@ const OUT_CATEGORIES = ['Purchase', 'Rent', 'Salary', 'Utilities', 'Transport', 
 interface Props {
   navigation: any;
   // `entry` is passed by the EditCashEntryModal route (from CashEntryDetail).
-  route?: { params?: { mode?: 'in' | 'out'; entry?: CashEntry } };
+  // `date` is the day the Cash Book was showing when Cash In/Out was tapped, so a
+  // forgotten entry lands on that day; the field stays editable for corrections.
+  route?: { params?: { mode?: 'in' | 'out'; entry?: CashEntry; date?: string } };
 }
 
 /**
@@ -54,8 +56,9 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
   const [category, setCategory] = useState(
     existingEntry?.category || CATEGORIES[0]
   );
+  const viewedDay = route?.params?.date;
   const [date, setDate] = useState(
-    existingEntry ? existingEntry.date : todayDate()
+    existingEntry ? existingEntry.date : (viewedDay && isValidDateValue(viewedDay) ? viewedDay : todayDate())
   );
   const [note, setNote] = useState(
     existingEntry?.note ?? ''

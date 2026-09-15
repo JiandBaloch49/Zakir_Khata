@@ -115,5 +115,6 @@ export const ur: Record<TKey, string> = {
   "country8": "کویت",
   "country9": "بحرین",
   "country10": "ملائیشیا",
-  "country11": "انڈونیشیا"
+  "country11": "انڈونیشیا",
+  "photoOf": "تصویر: {name}"
 };

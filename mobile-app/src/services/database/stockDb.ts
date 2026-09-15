@@ -1,4 +1,6 @@
 import { getDatabase } from './db';
+import { parseDateValue } from '../../utils/dates';
+import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
 import { StockItem, StockMovement } from '../../types/stock.types';
 import { writeWithSync } from './syncHelpers';
 
@@ -152,50 +154,138 @@ export interface StockReportEntry extends StockMovement {
   unit: string;
 }
 
-export const getStockInReport = async (userId: string, startDate?: string, endDate?: string): Promise<StockReportEntry[]> => {
-  const db = await getDatabase();
-  let query = `
-    SELECT m.*, i.name_en as item_name_en, i.name_ur as item_name_ur, i.unit 
-    FROM stock_movements m
-    JOIN stock_items i ON m.item_id = i.id
-    WHERE m.change > 0 AND m.is_deleted = 0 AND i.is_deleted = 0
-    AND (i.user_id = ? OR i.user_id IN (SELECT id FROM users WHERE parentId = ?) OR i.user_id IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?)))
-  `;
-  const params: any[] = [userId, userId, userId];
+export type StockMovementSummary = { entries: number; qty: number; amount: number };
+export type StockMovementDayTotal = { day: string; entries: number; qty: number; amount: number };
+export type StockMovementFilter = { startDate?: string; endDate?: string; search?: string };
 
-  if (startDate) {
-    query += ` AND date(m.date) >= date(?)`;
-    params.push(startDate);
+const MOVEMENT_KEYS = { date: 'm.date', id: 'm.id' } as const;
+
+/**
+ * THE one predicate for the Stock IN / OUT reports: rows, the header summary and the
+ * day subtotals all come from here. Scoped by the ITEM's owner tree (a parent-owned
+ * item moved by their sub-staff is still theirs). `search` matches the item name in
+ * SQL so paged results and totals follow it together.
+ */
+const movementWhere = (userId: string, direction: 'in' | 'out', filter: StockMovementFilter) => {
+  const { startDate, endDate } = filter;
+  for (const date of [startDate, endDate]) {
+    if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date))) {
+      throw new Error('Invalid date range.');
+    }
   }
-  if (endDate) {
-    query += ` AND date(m.date) <= date(?)`;
-    params.push(endDate);
+  if (startDate && endDate && startDate > endDate) throw new Error('From date must not be after To date.');
+  let where = `${direction === 'in' ? 'm.change > 0' : 'm.change < 0'} AND m.is_deleted = 0 AND i.is_deleted = 0
+    AND (i.user_id = ? OR i.user_id IN (SELECT id FROM users WHERE parentId = ?) OR i.user_id IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?)))`;
+  const params: any[] = [userId, userId, userId];
+  if (startDate) { where += ' AND date(m.date) >= date(?)'; params.push(startDate); }
+  if (endDate) { where += ' AND date(m.date) <= date(?)'; params.push(endDate); }
+  const search = filter.search?.trim().toLowerCase();
+  if (search) {
+    // Literal substring search on either name, never SQL wildcards.
+    where += " AND (instr(lower(COALESCE(i.name_en, '')), ?) > 0 OR instr(lower(COALESCE(i.name_ur, '')), ?) > 0)";
+    params.push(search, search);
   }
-  
-  query += ` ORDER BY m.date DESC`;
-  return db.getAllAsync<StockReportEntry>(query, params);
+  const rate = direction === 'in' ? 'COALESCE(m.cost_per_unit, 0)' : 'COALESCE(m.sale_price_unit, m.cost_per_unit, 0)';
+  return { where, params, rate };
 };
 
-export const getStockOutReport = async (userId: string, startDate?: string, endDate?: string): Promise<StockReportEntry[]> => {
+/**
+ * The Stock IN / Stock OUT report: one movement per row.
+ *   IN  amount = qty × cost_per_unit
+ *   OUT amount = qty × (sale_price_unit, else cost_per_unit)   — exactly the screens' maths
+ * `after` pages the ROWS only (keyset on date, id — movements have no creation
+ * timestamp); the summary is a SQL aggregate over the whole filtered set.
+ * Money columns are integer paisa.
+ */
+export const getStockMovementReport = async (
+  userId: string,
+  direction: 'in' | 'out',
+  startDate?: string,
+  endDate?: string,
+  limit = -1,
+  after?: PageCursor | null,
+  search?: string
+): Promise<{ rows: StockReportEntry[]; summary: StockMovementSummary; nextCursor: PageCursor | null }> => {
+  const { where, params, rate } = movementWhere(userId, direction, { startDate, endDate, search });
   const db = await getDatabase();
-  let query = `
-    SELECT m.*, i.name_en as item_name_en, i.name_ur as item_name_ur, i.unit 
-    FROM stock_movements m
-    JOIN stock_items i ON m.item_id = i.id
-    WHERE m.change < 0 AND m.is_deleted = 0 AND i.is_deleted = 0
-    AND (i.user_id = ? OR i.user_id IN (SELECT id FROM users WHERE parentId = ?) OR i.user_id IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?)))
-  `;
-  const params: any[] = [userId, userId, userId];
+  const rowsWhere = after ? `${where} AND ${keysetClause(MOVEMENT_KEYS)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after, MOVEMENT_KEYS)] : params;
+  const rows = await db.getAllAsync<StockReportEntry>(
+    `SELECT m.*, i.name_en as item_name_en, i.name_ur as item_name_ur, i.unit
+       FROM stock_movements m
+       JOIN stock_items i ON m.item_id = i.id
+      WHERE ${rowsWhere}
+      ORDER BY m.date DESC, m.id DESC LIMIT ?`, [...rowsParams, limit]
+  );
+  const summary = await db.getFirstAsync<StockMovementSummary>(
+    `SELECT COUNT(*) AS entries,
+            COALESCE(SUM(ABS(m.change)), 0) AS qty,
+            COALESCE(SUM(ABS(m.change) * ${rate}), 0) AS amount
+       FROM stock_movements m
+       JOIN stock_items i ON m.item_id = i.id
+      WHERE ${where}`, params
+  );
+  return { rows, summary: summary ?? { entries: 0, qty: 0, amount: 0 }, nextCursor: nextCursorOf(rows, limit, { date: 'date', id: 'id' }) };
+};
 
-  if (startDate) {
-    query += ` AND date(m.date) >= date(?)`;
-    params.push(startDate);
-  }
-  if (endDate) {
-    query += ` AND date(m.date) <= date(?)`;
-    params.push(endDate);
-  }
-  
-  query += ` ORDER BY m.date DESC`;
-  return db.getAllAsync<StockReportEntry>(query, params);
+/** Every calendar day in the filtered report with its SQL subtotal — one query per filter change. */
+export const getStockMovementDayTotals = async (
+  userId: string, direction: 'in' | 'out', startDate?: string, endDate?: string, search?: string
+): Promise<StockMovementDayTotal[]> => {
+  const { where, params, rate } = movementWhere(userId, direction, { startDate, endDate, search });
+  const db = await getDatabase();
+  return db.getAllAsync<StockMovementDayTotal>(
+    `SELECT date(m.date) AS day, COUNT(*) AS entries,
+            COALESCE(SUM(ABS(m.change)), 0) AS qty,
+            COALESCE(SUM(ABS(m.change) * ${rate}), 0) AS amount
+       FROM stock_movements m
+       JOIN stock_items i ON m.item_id = i.id
+      WHERE ${where}
+      GROUP BY date(m.date)
+      ORDER BY day DESC`, params
+  );
+};
+
+export const getStockInReport = async (userId: string, startDate?: string, endDate?: string): Promise<StockReportEntry[]> =>
+  (await getStockMovementReport(userId, 'in', startDate, endDate)).rows;
+
+export const getStockOutReport = async (userId: string, startDate?: string, endDate?: string): Promise<StockReportEntry[]> =>
+  (await getStockMovementReport(userId, 'out', startDate, endDate)).rows;
+
+/** Months (YYYY-MM) in which an item moved — for the item screen's month pills. */
+export const getItemMovementMonths = async (itemId: string): Promise<string[]> => {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<{ month: string }>(
+    `SELECT DISTINCT strftime('%Y-%m', date) AS month FROM stock_movements
+      WHERE item_id = ? AND is_deleted = 0 AND strftime('%Y-%m', date) IS NOT NULL ORDER BY month`, [itemId]
+  );
+  return rows.map(r => r.month).filter(Boolean);
+};
+
+/**
+ * One item's movements for one month (or all months), paged, with the month's
+ * In / Out quantities as a SQL aggregate — the month is filtered in SQL, not by
+ * loading every month and filtering in JS.
+ */
+export const getItemMovements = async (
+  itemId: string, month: string | 'ALL', limit = -1, after?: PageCursor | null
+): Promise<{ rows: StockMovement[]; summary: { totalIn: number; totalOut: number; count: number }; nextCursor: PageCursor | null }> => {
+  if (month !== 'ALL' && !/^\d{4}-\d{2}$/.test(month)) throw new Error('Invalid month.');
+  let where = 'item_id = ? AND is_deleted = 0';
+  const params: any[] = [itemId];
+  if (month !== 'ALL') { where += " AND strftime('%Y-%m', date) = ?"; params.push(month); }
+  const db = await getDatabase();
+  const keys = { date: 'date', id: 'id' } as const;
+  const rowsWhere = after ? `${where} AND ${keysetClause(keys)}` : where;
+  const rowsParams = after ? [...params, ...keysetParams(after, keys)] : params;
+  const rows = await db.getAllAsync<StockMovement>(
+    `SELECT * FROM stock_movements WHERE ${rowsWhere} ORDER BY date DESC, id DESC LIMIT ?`, [...rowsParams, limit]
+  );
+  const summary = await db.getFirstAsync<{ totalIn: number; totalOut: number; count: number }>(
+    `SELECT COALESCE(SUM(CASE WHEN change > 0 THEN change ELSE 0 END), 0) AS totalIn,
+            COALESCE(SUM(CASE WHEN change < 0 THEN -change ELSE 0 END), 0) AS totalOut,
+            COUNT(*) AS count
+       FROM stock_movements WHERE ${where}`, params
+  );
+  return { rows, summary: summary ?? { totalIn: 0, totalOut: 0, count: 0 }, nextCursor: nextCursorOf(rows, limit, keys) };
 };

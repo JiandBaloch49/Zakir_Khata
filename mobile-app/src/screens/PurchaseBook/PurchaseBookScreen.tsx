@@ -1,6 +1,6 @@
 import React, { useEffect, useCallback, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, FlatList,
+  View, Text, TouchableOpacity, StyleSheet, SectionList,
   ActivityIndicator, RefreshControl, Keyboard, Platform
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -10,6 +10,8 @@ import { PurchaseOrder, PurchaseInvoice } from '../../types/purchase.types';
 import { formatCurrency } from '../../utils/calculations';
 import { Colors } from '../../theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
+import { DateRangeFilter, DateRange, describeRange } from '../../components/ui/DateRangeFilter';
+import { toDateValue, formatDisplayDate } from '../../utils/dates';
 
 const STATUS_COLORS: Record<string, { bg: string; text: string }> = {
   draft:     { bg: '#374151', text: '#D1D5DB' },
@@ -69,7 +71,11 @@ const InvoiceCard = React.memo(({ item, onPress }: { item: PurchaseInvoice; onPr
 export const PurchaseBookScreen = ({ navigation }: any) => {
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
-  const { orders, invoices, summary, loading, loadOrders, loadInvoices, loadSummary } = usePurchaseStore();
+  const { summary, loading, loadSummary, filter, setFilter, orderList, invoiceList, loadLists, loadMore } = usePurchaseStore();
+  const range: DateRange = { startDate: filter.startDate, endDate: filter.endDate };
+  const setRange = (next: DateRange) => { if (user) setFilter(user.id, { ...filter, ...next }); };
+  const orders = orderList.rows as PurchaseOrder[];
+  const invoices = invoiceList.rows as PurchaseInvoice[];
   const [tab, setTab] = useState<'orders' | 'invoices'>('orders');
   const [refreshing, setRefreshing] = useState(false);
   const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
@@ -92,7 +98,7 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
 
   const load = useCallback(async () => {
     if (!user?.id) return;
-    await Promise.all([loadOrders(user.id), loadInvoices(user.id), loadSummary(user.id)]);
+    await Promise.all([loadLists(user.id), loadSummary(user.id)]);
   }, [user?.id]);
 
   const onRefresh = async () => {
@@ -106,10 +112,51 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
     return unsub;
   }, [navigation, load]);
 
+  // Loaded rows grouped by day (order_date / invoice_date); a day straddling a page
+  // boundary keeps ONE section whose header shows the day's whole SQL subtotal.
+  const group = (rows: any[], dateKey: string) => {
+    const byDay = new Map<string, any[]>();
+    for (const r of rows) { const day = toDateValue(r[dateKey]) || String(r[dateKey]); const l = byDay.get(day); if (l) l.push(r); else byDay.set(day, [r]); }
+    return [...byDay.entries()].map(([day, data]) => ({ day, data }));
+  };
+  const orderSections = React.useMemo(() => group(orders, 'order_date'), [orders]);
+  const invoiceSections = React.useMemo(() => group(invoices, 'invoice_date'), [invoices]);
+
+  // Day header: how many, what it came to, and how much of it is settled — "Received"
+  // (goods received against orders) or "Paid" (cash against invoices).
+  const dayHeader = (totals: Record<string, any>, noun: string, settledLabel: string) => ({ section }: { section: { day: string } }) => {
+    const t = totals[section.day];
+    return (
+      <View style={styles.dayHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
+          {t && <Text style={styles.dayCount}>{t.count} {t.count === 1 ? noun : noun + 's'}</Text>}
+        </View>
+        {t && (
+          <View style={styles.dayRight}>
+            <View style={styles.dayCols}>
+              <Text style={[styles.dayColLabel, { color: Colors.textGray }]}>Total</Text>
+              <Text style={[styles.dayColLabel, { color: Colors.success }]}>{settledLabel}</Text>
+            </View>
+            <View style={styles.dayCols}>
+              <Text style={[styles.dayColVal, { color: Colors.textWhite }]}>{formatCurrency(t.total)}</Text>
+              <Text style={[styles.dayColVal, { color: Colors.success }]}>{formatCurrency(t.settled)}</Text>
+            </View>
+          </View>
+        )}
+      </View>
+    );
+  };
+
   return (
     <View style={{ flex: 1, backgroundColor: Colors.bgPrimary }}>
       {/* Top Header with Profile & Books Bar */}
       <TopHeaderWithBooks navigation={navigation} activeBook="PurchaseBook" />
+
+      {/* Range — shared control, opens on this month; both tabs follow it */}
+      <View style={{ paddingHorizontal: 12 }}>
+        <DateRangeFilter value={range} onChange={setRange} fieldStyle={styles.rangeField} textStyle={styles.rangeText} />
+      </View>
 
       {/* Summary Tiles */}
       {summary && (
@@ -136,25 +183,31 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
       {/* Tab Bar */}
       <View style={styles.tabBar}>
         <TouchableOpacity style={[styles.tab, tab === 'orders' && styles.tabActive]} onPress={() => setTab('orders')}>
-          <Text style={[styles.tabText, tab === 'orders' && styles.tabTextActive]}>📦 Orders ({orders.length})</Text>
+          <Text style={[styles.tabText, tab === 'orders' && styles.tabTextActive]}>📦 Orders ({orderList.summary.count})</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[styles.tab, tab === 'invoices' && styles.tabActive]} onPress={() => setTab('invoices')}>
-          <Text style={[styles.tabText, tab === 'invoices' && styles.tabTextActive]}>🧾 Invoices ({invoices.length})</Text>
+          <Text style={[styles.tabText, tab === 'invoices' && styles.tabTextActive]}>🧾 Invoices ({invoiceList.summary.count})</Text>
         </TouchableOpacity>
       </View>
 
       {loading && !refreshing ? (
         <ActivityIndicator size="large" color={Colors.primary} style={{ flex: 1 }} />
       ) : tab === 'orders' ? (
-        <FlatList
-          data={orders}
+        <SectionList
+          sections={orderSections}
           keyExtractor={i => i.id}
           contentContainerStyle={{ padding: 14, paddingBottom: 150 }}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.textWhite} />}
           renderItem={({ item }) => (
             <OrderCard item={item} onPress={() => navigation.navigate('PurchaseOrderDetail', { orderId: item.id })} />
           )}
+          renderSectionHeader={dayHeader(orderList.dayTotals, 'order', 'Received')}
+          stickySectionHeadersEnabled
+          onEndReached={() => { if (user) loadMore(user.id, 'orders'); }}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={orderList.loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
           ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          SectionSeparatorComponent={() => <View style={{ height: 10 }} />}
           ListEmptyComponent={
             <View style={styles.empty}>
               <Text style={styles.emptyTitle}>No Purchase Orders</Text>
@@ -165,15 +218,21 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
           }
         />
       ) : (
-        <FlatList
-          data={invoices}
+        <SectionList
+          sections={invoiceSections}
           keyExtractor={i => i.id}
           contentContainerStyle={{ padding: 14, paddingBottom: 150 }}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.textWhite} />}
           renderItem={({ item }) => (
             <InvoiceCard item={item} onPress={() => navigation.navigate('PurchaseInvoiceDetail', { invoiceId: item.id })} />
           )}
+          renderSectionHeader={dayHeader(invoiceList.dayTotals, 'invoice', 'Paid')}
+          stickySectionHeadersEnabled
+          onEndReached={() => { if (user) loadMore(user.id, 'invoices'); }}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={invoiceList.loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
           ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          SectionSeparatorComponent={() => <View style={{ height: 10 }} />}
           ListEmptyComponent={
             <View style={styles.empty}>
               <Text style={styles.emptyTitle}>No Invoices Yet</Text>
@@ -211,6 +270,20 @@ const styles = StyleSheet.create({
   addBtn: { backgroundColor: 'rgba(0,166,81,0.2)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, borderWidth: 1, borderColor: Colors.primaryLight },
   addBtnText: { color: Colors.primaryLight, fontWeight: '700', fontSize: 13 },
   summaryRow: { flexDirection: 'row', padding: 12, gap: 6 },
+  rangeField: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgCard, borderWidth: 1, borderColor: Colors.border, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8, minHeight: 36 },
+  rangeText: { fontSize: 11, color: Colors.textGray, fontWeight: '600' },
+  // Day header — the Cash Book day-header banner with Total / settled columns.
+  dayHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    backgroundColor: Colors.bgCard, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
+    borderWidth: 1, borderColor: Colors.border, marginBottom: 10,
+  },
+  dayTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
+  dayCount: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
+  dayRight: { alignItems: 'flex-end' },
+  dayCols: { flexDirection: 'row', gap: 16 },
+  dayColLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right', marginBottom: 2 },
+  dayColVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
   tile: { flex: 1, borderRadius: 12, padding: 10, alignItems: 'center', backgroundColor: Colors.bgCard, borderWidth: 1, borderColor: Colors.border },
   tileVal: { fontSize: 14, fontWeight: '800', color: Colors.textWhite, marginBottom: 2 },
   tileLabel: { fontSize: 9, color: Colors.textGray, fontWeight: '600', textAlign: 'center' },
